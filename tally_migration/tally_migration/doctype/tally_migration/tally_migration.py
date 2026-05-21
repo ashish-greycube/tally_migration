@@ -436,7 +436,7 @@ class TallyMigration(Document):
 					+ voucher.find_all("INVENTORYENTRIESOUT.LIST")
 				)
 				if (
-					voucher.VOUCHERTYPENAME.string.strip() not in ["Journal", "Receipt", "Payment", "Contra"]
+					voucher.VOUCHERTYPENAME.string.strip() not in ["Journal", "Receipt", "Payment", "Contra", "Sales"]
 					and inventory_entries
 				):
 					function = voucher_to_invoice
