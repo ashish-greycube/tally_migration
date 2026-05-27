@@ -599,15 +599,12 @@ class TallyMigration(Document):
 
 	def _import_day_book_data(self):
 		def create_fiscal_years(vouchers):
-			print(vouchers)
 			from frappe.utils.data import add_years, getdate
 
 			earliest_date = getdate(min(voucher["posting_date"] for voucher in vouchers))
-			print("=================\n", earliest_date)
 			oldest_year = frappe.get_all(
 				"Fiscal Year", fields=["year_start_date", "year_end_date"], order_by="year_start_date"
 			)[0]
-			print("=========================\n",oldest_year)
 			while earliest_date < oldest_year.year_start_date:
 				new_year = frappe.get_doc({"doctype": "Fiscal Year"})
 				new_year.year_start_date = add_years(oldest_year.year_start_date, -1)
@@ -725,8 +722,7 @@ class TallyMigration(Document):
 	@frappe.whitelist()
 	def process_master_data(self):
 		self.set_status("Processing Master Data")
-		# frappe.enqueue_doc(self.doctype, self.name, "_process_master_data", queue="long", timeout=3600)
-		self._process_master_data()
+		frappe.enqueue_doc(self.doctype, self.name, "_process_master_data", queue="long", timeout=3600)
 
 	@frappe.whitelist()
 	def import_master_data(self):
@@ -741,8 +737,7 @@ class TallyMigration(Document):
 	@frappe.whitelist()
 	def import_day_book_data(self):
 		self.set_status("Importing Day Book Data")
-		# frappe.enqueue_doc(self.doctype, self.name, "_import_day_book_data", queue="long", timeout=3600)
-		self._import_day_book_data()
+		frappe.enqueue_doc(self.doctype, self.name, "_import_day_book_data", queue="long", timeout=3600)
 
 	def log(self, data=None):
 		if isinstance(data, frappe.model.document.Document):
