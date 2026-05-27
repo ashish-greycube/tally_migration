@@ -1,17 +1,19 @@
 # Tally Migration
 
-A Frappe/ERPNext app to migrate data from Tally ERP into ERPNext. Built and maintained by [Greycube Technologies](https://greycube.in).
+A Frappe/ERPNext app to migrate data from Tally Prime into ERPNext. Built and maintained by [Greycube Technologies](https://greycube.in).
 
 ## What It Does
 
 This app provides a step-by-step wizard to import your complete Tally dataset into ERPNext:
 
 **Master Data** (from Tally's Master Data XML export):
+
 - Chart of Accounts
 - Customers and Suppliers with addresses
 - Stock Items and Units of Measure (UOMs)
 
 **Transactional Data** (from Tally's Day Book XML export):
+
 - Journal Entries — for Journal, Receipt, Payment, and Contra vouchers
 - Sales Invoices and Purchase Invoices — for inventory-based Sales, Purchase, Credit Note, and Debit Note vouchers
 
@@ -39,8 +41,6 @@ Export two XML files from Tally:
 
 1. **Master Data** — contains Chart of Accounts, Ledgers, Stock Items, and UOMs.
 2. **Day Book** — contains all historical vouchers/transactions.
-
-Both plain XML and ZIP-compressed XML are supported. UTF-8 and UTF-16 encodings are handled automatically.
 
 ### Step 2 — Process Master Data
 
@@ -82,17 +82,17 @@ Any records that fail to import are captured in the **Failed Import Log** sectio
 
 ## Voucher Type Mapping
 
-| Tally Voucher Type | ERPNext Document |
-|--------------------|-----------------|
-| Journal | Journal Entry |
-| Receipt | Journal Entry |
-| Payment | Journal Entry |
-| Contra | Journal Entry |
-| Sales (with inventory) | Sales Invoice |
-| Purchase (with inventory) | Purchase Invoice |
-| Credit Note (with inventory) | Sales Invoice |
-| Debit Note (with inventory) | Purchase Invoice |
-| Sales (no inventory) | Journal Entry |
+| Tally Voucher Type           | ERPNext Document |
+| ---------------------------- | ---------------- |
+| Journal                      | Journal Entry    |
+| Receipt                      | Journal Entry    |
+| Payment                      | Journal Entry    |
+| Contra                       | Journal Entry    |
+| Sales (without inventory)    | Journal Entry    |
+| Purchase (with inventory)    | Purchase Invoice |
+| Credit Note (with inventory) | Sales Invoice    |
+| Debit Note (with inventory)  | Purchase Invoice |
+| Sales (with inventory)       | Sales Invoice    |
 
 ## Contributing
 
