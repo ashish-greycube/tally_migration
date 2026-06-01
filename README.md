@@ -1,3 +1,6 @@
+<img width="960" height="540" alt="image" src="https://github.com/user-attachments/assets/d67b39fc-8cf2-4b83-b8f6-ad600d547f2c" />
+
+
 # Tally Migration
 
 A Frappe/ERPNext app to migrate data from Tally Prime into ERPNext. Built and maintained by [Greycube Technologies](https://greycube.in).
