@@ -1,3 +1,5 @@
+# ![](assets/20260601_111445_Migrate_Tally_to_ERPNext_GreyCube_1.png)
+
 # Tally Migration
 
 A Frappe/ERPNext app to migrate data from Tally Prime into ERPNext. Built and maintained by [Greycube Technologies](https://greycube.in).
@@ -82,8 +84,9 @@ Any records that fail to import are captured in the **Failed Import Log** sectio
 
 ## Voucher Type Mapping
 
+
 | Tally Voucher Type           | ERPNext Document |
-| ---------------------------- | ---------------- |
+| ------------------------------ | ------------------ |
 | Journal                      | Journal Entry    |
 | Receipt                      | Journal Entry    |
 | Payment                      | Journal Entry    |
