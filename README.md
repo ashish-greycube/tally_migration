@@ -1,4 +1,5 @@
-# ![](assets/20260601_111445_Migrate_Tally_to_ERPNext_GreyCube_1.png)
+# <img width="960" height="540" alt="image" src="https://github.com/user-attachments/assets/7e031b0d-1105-4231-a570-1de05d50e708" />
+
 
 # Tally Migration
 
