@@ -109,7 +109,7 @@ frappe.ui.form.on("Tally Migration", {
             frm.toggle_display(field, false);
             return;
         }
-        let rows = erpnext.tally_migration.get_html_rows(shown_logs, field);
+        let rows = erpnext.tally_migration.get_html_rows(frm, shown_logs, field);
         let rows_head, table_caption;
 
         let table_footer =
@@ -222,9 +222,8 @@ erpnext.tally_migration.cleanDoc = (obj) => {
     return temp;
 };
 
-erpnext.tally_migration.unresolve = (document) => {
+erpnext.tally_migration.unresolve = (frm, document) => {
     /* Mark document migration as unresolved ie. move to failed error log */
-    let frm = cur_frm;
     let failed_log = erpnext.tally_migration.failed_import_log;
     let fixed_log = erpnext.tally_migration.fixed_errors_log;
 
@@ -243,9 +242,8 @@ erpnext.tally_migration.unresolve = (document) => {
     frm.save();
 };
 
-erpnext.tally_migration.resolve = (document) => {
+erpnext.tally_migration.resolve = (frm, document) => {
     /* Mark document migration as resolved ie. move to fixed error log */
-    let frm = cur_frm;
     let failed_log = erpnext.tally_migration.failed_import_log;
     let fixed_log = erpnext.tally_migration.fixed_errors_log;
 
@@ -263,9 +261,9 @@ erpnext.tally_migration.resolve = (document) => {
     frm.save();
 };
 
-erpnext.tally_migration.create_new_doc = (document) => {
+erpnext.tally_migration.create_new_doc = (frm, document) => {
     /* Mark as resolved and create new document */
-    erpnext.tally_migration.resolve(document);
+    erpnext.tally_migration.resolve(frm, document);
     return frappe.call({
         type: "POST",
         method: "tally_migration.tally_migration.doctype.tally_migration.tally_migration.new_doc",
@@ -283,7 +281,7 @@ erpnext.tally_migration.create_new_doc = (document) => {
     });
 };
 
-erpnext.tally_migration.get_html_rows = (logs, field) => {
+erpnext.tally_migration.get_html_rows = (frm, logs, field) => {
     let index = 0;
     let rows = logs
         .map(({ doc, exc }) => {

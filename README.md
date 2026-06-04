@@ -28,14 +28,6 @@ All imported documents are tagged with the original Tally GUID and Voucher Numbe
 - Python >= 3.10
 - `beautifulsoup4` with `lxml` parser (for XML parsing)
 
-## Installation
-
-```bash
-cd $PATH_TO_YOUR_BENCH
-bench get-app $URL_OF_THIS_REPO --branch main
-bench install-app tally_migration
-```
-
 ## Migration Workflow
 
 ### Step 1 — Export Data from Tally
