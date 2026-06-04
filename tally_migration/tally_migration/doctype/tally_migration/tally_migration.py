@@ -111,7 +111,7 @@ class TallyMigration(Document):
 		self.default_cost_center, self.default_round_off_account = frappe.db.get_value(
 			"Company", self.erpnext_company, ["cost_center", "round_off_account"]
 		)
-		self.default_warehouse = frappe.db.get_value("Stock Settings", "Stock Settings", "default_warehouse")
+		self.default_warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
 
 	def _process_master_data(self):
 		def get_company_name(collection):
@@ -413,7 +413,7 @@ class TallyMigration(Document):
 
 			self.set_account_defaults()
 			self.is_master_data_imported = 1
-			frappe.db.commit()
+			frappe.db.commit()  # nosemgrep
 
 		except Exception:
 			self.publish("Import Master Data", _("Process Failed"), -1, 5)
@@ -747,7 +747,7 @@ class TallyMigration(Document):
 				failed_import_log.append({"doc": doc, "exc": traceback.format_exc()})
 				self.failed_import_log = json.dumps(failed_import_log, separators=(",", ":"))
 				self.save()
-				frappe.db.commit()
+				frappe.db.commit() # nosemgrep
 
 		else:
 			data = data or self.status
