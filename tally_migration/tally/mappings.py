@@ -1,0 +1,351 @@
+from __future__ import annotations
+
+import re
+
+
+def norm_group(name: str) -> str:
+    """Canonical key for MATCHING a Tally group / ledger name: case- and
+    whitespace-insensitive.
+
+    Tally group names are matched against the reserved-group tables and the Sundry
+    Debtors / Creditors roots by this key, so a chart that types its groups in a
+    different case ("SUNDRY DEBTORS") or with stray / doubled spaces still classifies
+    correctly - otherwise every party under a differently-cased root imports as a plain
+    ledger instead of a Customer / Supplier. Used ONLY for lookups: the original name is
+    always what gets created in ERPNext, so the imported record keeps its Tally casing.
+    ``casefold`` (not ``lower``) so non-ASCII names fold correctly; ``" ".join(split())``
+    trims the ends and collapses internal runs of whitespace."""
+    return " ".join(str(name or "").split()).casefold()
+
+
+# ── Tally root groups that classify ledgers as customers / suppliers ──────────
+
+DEBTOR_ROOTS   = {"Sundry Debtors"}
+CREDITOR_ROOTS = {"Sundry Creditors"}
+# Normalised forms used for the actual matching (see norm_group / LedgerResolver).
+DEBTOR_ROOTS_NORM   = {norm_group(n) for n in DEBTOR_ROOTS}
+CREDITOR_ROOTS_NORM = {norm_group(n) for n in CREDITOR_ROOTS}
+
+# ── Stock vs non-stock item classification ────────────────────────────────────
+
+def is_stock_item(record: dict) -> int:
+    """1 if a Tally Stock Item maps to a stock-tracked ERPNext Item, else 0.
+
+    A Tally item whose GST supply type is 'Services' becomes a non-stock Item in
+    ERPNext (it cannot hold stock); every other supply type stays a stock item.
+    Pure (no Frappe), so both the importer and the read-only reconciliation can
+    share one definition - the reconciliation must count opening stock for exactly
+    the items the importer will post, or a service item with an opening quantity
+    creates a phantom stock variance."""
+    supply = (record.get("TypeOfSupply") or "").strip().lower()
+    return 0 if supply in ("services", "service") else 1
+
+# ── Unit of Measure: Tally → ERPNext ─────────────────────────────────────────
+
+UOM_MAP: dict[str, str] = {
+    # Count
+    "Nos": "Nos", "No": "Nos", "NOS": "Nos", "PCS": "Nos", "Pcs": "Nos",
+    "Units": "Nos", "Unit": "Nos", "U": "Nos", "EA": "Nos", "Each": "Nos",
+    "Pc": "Nos", "pc": "Nos",
+    # Weight
+    "Kgs": "Kg", "KG": "Kg", "Kg": "Kg", "KGS": "Kg", "kgs": "Kg",
+    "Gm": "Gram", "GM": "Gram", "GMS": "Gram", "g": "Gram", "Gms": "Gram",
+    "Ton": "Tonne", "TON": "Tonne", "MT": "Tonne", "Tonne": "Tonne",
+    "Quintal": "Quintal", "QTL": "Quintal",
+    # Volume
+    "Ltr": "Litre", "LTR": "Litre", "Lts": "Litre", "L": "Litre", "ltr": "Litre",
+    "Ml": "Ml", "ML": "Ml", "ml": "Ml",
+    # Length
+    "Mtr": "Metre", "MTR": "Metre", "Meter": "Metre", "M": "Metre", "mtr": "Metre",
+    "Feet": "Feet", "FT": "Feet", "Ft": "Feet", "ft": "Feet",
+    "Inch": "Inch", "INCH": "Inch", "IN": "Inch", "in": "Inch",
+    "Cm": "Cm", "CM": "Cm", "cm": "Cm",
+    "Mm": "Mm", "MM": "Mm",
+    # Area
+    "Sqft": "Sq ft", "SQFT": "Sq ft", "SqFt": "Sq ft", "sq ft": "Sq ft",
+    "Sqm": "Sq m", "SQM": "Sq m",
+    # Packs
+    "Box": "Box", "BOX": "Box",
+    "Doz": "Dozen", "DOZ": "Dozen", "Dozen": "Dozen",
+    "Pkt": "Packet", "PKT": "Packet", "Packet": "Packet",
+    "Roll": "Roll", "ROLL": "Roll",
+    "Set": "Set", "SET": "Set",
+    "Bag": "Bag", "BAG": "Bag",
+    "Bndl": "Bundle", "Bundle": "Bundle",
+    "Can": "Can", "CAN": "Can",
+    "Pair": "Pair", "PAIR": "Pair",
+    "Sheet": "Sheet", "SHEET": "Sheet",
+    # Time
+    "Hrs": "Hour", "HRS": "Hour", "Hr": "Hour", "Hour": "Hour",
+    "Day": "Day", "DAY": "Day",
+    "Wk": "Week", "WK": "Week", "Week": "Week",
+    "Month": "Month", "MONTH": "Month",
+}
+
+DEFAULT_UOM = "Nos"
+
+# ── Tally state names → ERPNext state names ───────────────────────────────────
+
+TALLY_STATE_MAP: dict[str, str] = {
+    "Andaman and Nicobar Islands": "Andaman and Nicobar Islands",
+    "Andhra Pradesh":              "Andhra Pradesh",
+    "Arunachal Pradesh":           "Arunachal Pradesh",
+    "Assam":                       "Assam",
+    "Bihar":                       "Bihar",
+    "Chandigarh":                  "Chandigarh",
+    "Chhattisgarh":                "Chhattisgarh",
+    # Dadra & Nagar Haveli and Daman & Diu were merged into a single union
+    # territory in 2020. India Compliance (and current ERPNext) know only the
+    # merged name, so BOTH the pre-2020 split names and the merged name map to it.
+    # The "&" / "and" and case/spacing variants Tally may export are handled by
+    # resolve_tally_state below, so only the canonical "and" keys are needed here.
+    "Dadra and Nagar Haveli and Daman and Diu": "Dadra and Nagar Haveli and Daman and Diu",
+    "Dadra and Nagar Haveli":      "Dadra and Nagar Haveli and Daman and Diu",
+    "Daman and Diu":               "Dadra and Nagar Haveli and Daman and Diu",
+    "Delhi":                       "Delhi",
+    "Goa":                         "Goa",
+    "Gujarat":                     "Gujarat",
+    "Haryana":                     "Haryana",
+    "Himachal Pradesh":            "Himachal Pradesh",
+    "Jammu & Kashmir":             "Jammu and Kashmir",
+    "Jammu and Kashmir":           "Jammu and Kashmir",
+    "Jharkhand":                   "Jharkhand",
+    "Karnataka":                   "Karnataka",
+    "Kerala":                      "Kerala",
+    "Ladakh":                      "Ladakh",
+    "Lakshadweep":                 "Lakshadweep",
+    "Madhya Pradesh":              "Madhya Pradesh",
+    "Maharashtra":                 "Maharashtra",
+    "Manipur":                     "Manipur",
+    "Meghalaya":                   "Meghalaya",
+    "Mizoram":                     "Mizoram",
+    "Nagaland":                    "Nagaland",
+    "Odisha":                      "Odisha",
+    "Puducherry":                  "Puducherry",
+    "Punjab":                      "Punjab",
+    "Rajasthan":                   "Rajasthan",
+    "Sikkim":                      "Sikkim",
+    "Tamil Nadu":                  "Tamil Nadu",
+    "Telangana":                   "Telangana",
+    "Tripura":                     "Tripura",
+    "Uttar Pradesh":               "Uttar Pradesh",
+    "Uttarakhand":                 "Uttarakhand",
+    "West Bengal":                 "West Bengal",
+}
+
+
+def _norm_state_key(name: str) -> str:
+    """Canonical key for matching a Tally state name: "&" treated as "and", plus
+    case- and whitespace-insensitive. So "Jammu & Kashmir", "JAMMU AND KASHMIR" and
+    "Dadra & Nagar Haveli and Daman & Diu" all match their canonical entry."""
+    return re.sub(r"\s+", " ", (name or "").replace("&", "and")).strip().casefold()
+
+
+# TALLY_STATE_MAP keyed by the normalised form, so a lookup tolerates the "&"/"and",
+# case and spacing variants a Tally export can carry for the same state.
+_NORMALISED_STATE_MAP: dict[str, str] = {
+    _norm_state_key(k): v for k, v in TALLY_STATE_MAP.items()
+}
+
+
+def resolve_tally_state(raw: str) -> str:
+    """ERPNext state name for a Tally state, tolerant of "&"/"and", case and spacing.
+    Returns "" when the value is blank or not a recognised Indian state."""
+    return _NORMALISED_STATE_MAP.get(_norm_state_key(raw), "")
+
+
+# ── ERPNext defaults ──────────────────────────────────────────────────────────
+# Customer Group MUST be a non-group (leaf) node - ERPNext rejects assigning a
+# group node ("All Customer Groups") to a Customer. "Commercial" is a standard
+# ERPNext leaf group present on every install.
+DEFAULT_CUSTOMER_GROUP = "Commercial"
+DEFAULT_SUPPLIER_GROUP = "All Supplier Groups"
+DEFAULT_ITEM_GROUP     = "All Item Groups"
+DEFAULT_TERRITORY      = "All Territories"
+# Base name of ERPNext's root warehouse. Warehouses are company-scoped and
+# suffixed with the company abbreviation, e.g. "All Warehouses - ABC".
+DEFAULT_WAREHOUSE      = "All Warehouses"
+
+
+# ── Country name aliases: Tally free-text → canonical ERPNext Country ─────────
+# ERPNext's Address.country is a Link to the Country doctype, so a value whose
+# name is not a Country row (e.g. Tally's "UAE") fails link validation and loses
+# the WHOLE address. Tally writes the country as free text, and books commonly
+# use a handful of unambiguous abbreviations. Map ONLY those - each maps to a
+# name that ships on every ERPNext install (the standard Country fixtures) - and
+# pass everything else through unchanged, so a value that is already a real
+# country name (the overwhelming majority) is never altered. Deliberately
+# conservative: only aliases with a single unambiguous target, to avoid ever
+# mapping to the wrong country. Keyed by a normalised (lower, no dots) form.
+# Keyed by the value with dots and whitespace removed and lower-cased, so all of
+# "UAE", "U.A.E.", "u.a.e" collapse to the same "uae". Safe because no real
+# multi-word country name collapses to one of these short keys (e.g. "United
+# States" -> "unitedstates", which is not a key, so it passes through unchanged).
+COUNTRY_ALIASES: dict[str, str] = {
+    "uae": "United Arab Emirates",
+    "usa": "United States",
+    "us":  "United States",
+    "uk":  "United Kingdom",
+}
+
+_COUNTRY_KEY = re.compile(r"[.\s]+")
+
+
+def normalize_country(name: str) -> str:
+    """Canonical ERPNext Country name for a Tally country value.
+
+    Returns the mapped name for a known unambiguous alias (case/dot/space
+    insensitive), else the original value trimmed - so a real country name passes
+    through byte-for-byte and only a recognised abbreviation is rewritten. Blank
+    stays blank (callers fall back to the company country)."""
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    key = _COUNTRY_KEY.sub("", raw.lower())
+    return COUNTRY_ALIASES.get(key, raw)
+
+
+# ── Chart of Accounts: Tally group → ERPNext account classification ───────────
+#
+# Tally ships ~28 reserved "primary" groups whose meaning is fixed. Every other
+# group/ledger inherits its nature from the nearest reserved ancestor. Each entry
+# maps a reserved Tally group to:
+#   root          - ERPNext root_type (Asset/Liability/Income/Expense/Equity)
+#   account_type  - ERPNext account_type ("" = ordinary group/ledger)
+#   erpnext_group - the ERPNext standard-COA group to reuse in coa_mode="reuse"
+
+ASSET, LIABILITY, INCOME, EXPENSE, EQUITY = (
+    "Asset", "Liability", "Income", "Expense", "Equity",
+)
+
+TALLY_GROUP_CLASSIFICATION: dict[str, dict] = {
+    # Equity
+    "Capital Account":          {"root": EQUITY,    "account_type": "Equity",             "erpnext_group": "Capital Account"},
+    "Reserves & Surplus":       {"root": EQUITY,    "account_type": "Equity",             "erpnext_group": "Capital Account"},
+    "Retained Earnings":        {"root": EQUITY,    "account_type": "Equity",             "erpnext_group": "Capital Account"},
+    # Liabilities
+    "Loans (Liability)":        {"root": LIABILITY, "account_type": "",                   "erpnext_group": "Loans (Liability)"},
+    "Secured Loans":            {"root": LIABILITY, "account_type": "",                   "erpnext_group": "Loans (Liability)"},
+    "Unsecured Loans":          {"root": LIABILITY, "account_type": "",                   "erpnext_group": "Loans (Liability)"},
+    "Bank OD A/c":              {"root": LIABILITY, "account_type": "Bank",               "erpnext_group": "Loans (Liability)"},
+    "Bank OCC A/c":             {"root": LIABILITY, "account_type": "Bank",               "erpnext_group": "Loans (Liability)"},
+    "Current Liabilities":      {"root": LIABILITY, "account_type": "",                   "erpnext_group": "Current Liabilities"},
+    "Duties & Taxes":           {"root": LIABILITY, "account_type": "Tax",                "erpnext_group": "Duties and Taxes"},
+    "Provisions":               {"root": LIABILITY, "account_type": "",                   "erpnext_group": "Current Liabilities"},
+    "Sundry Creditors":         {"root": LIABILITY, "account_type": "Payable",            "erpnext_group": "Current Liabilities"},
+    "Branch / Divisions":       {"root": LIABILITY, "account_type": "",                   "erpnext_group": "Current Liabilities"},
+    "Suspense A/c":             {"root": LIABILITY, "account_type": "Temporary",          "erpnext_group": "Current Liabilities"},
+    # Assets
+    "Fixed Assets":             {"root": ASSET,     "account_type": "Fixed Asset",        "erpnext_group": "Fixed Assets"},
+    "Investments":              {"root": ASSET,     "account_type": "",                   "erpnext_group": "Investments"},
+    "Current Assets":           {"root": ASSET,     "account_type": "",                   "erpnext_group": "Current Assets"},
+    "Bank Accounts":            {"root": ASSET,     "account_type": "Bank",               "erpnext_group": "Bank Accounts"},
+    "Cash-in-Hand":             {"root": ASSET,     "account_type": "Cash",               "erpnext_group": "Cash In Hand"},
+    "Deposits (Asset)":         {"root": ASSET,     "account_type": "",                   "erpnext_group": "Current Assets"},
+    "Loans & Advances (Asset)": {"root": ASSET,     "account_type": "",                   "erpnext_group": "Current Assets"},
+    "Stock-in-Hand":            {"root": ASSET,     "account_type": "Stock",              "erpnext_group": "Stock Assets"},
+    "Sundry Debtors":           {"root": ASSET,     "account_type": "Receivable",         "erpnext_group": "Current Assets"},
+    "Misc. Expenses (ASSET)":   {"root": ASSET,     "account_type": "",                   "erpnext_group": "Current Assets"},
+    # Income
+    "Sales Accounts":           {"root": INCOME,    "account_type": "Income Account",     "erpnext_group": "Direct Income"},
+    "Direct Incomes":           {"root": INCOME,    "account_type": "Income Account",     "erpnext_group": "Direct Income"},
+    "Indirect Incomes":         {"root": INCOME,    "account_type": "Income Account",     "erpnext_group": "Indirect Income"},
+    # Expenses
+    "Purchase Accounts":        {"root": EXPENSE,   "account_type": "Cost of Goods Sold", "erpnext_group": "Direct Expenses"},
+    "Direct Expenses":          {"root": EXPENSE,   "account_type": "Expense Account",    "erpnext_group": "Direct Expenses"},
+    "Indirect Expenses":        {"root": EXPENSE,   "account_type": "Expense Account",    "erpnext_group": "Indirect Expenses"},
+}
+
+# Tally display-name variants → canonical reserved-group key above.
+TALLY_GROUP_ALIASES: dict[str, str] = {
+    "Income (Direct)":        "Direct Incomes",
+    "Direct Income":          "Direct Incomes",
+    "Income (Indirect)":      "Indirect Incomes",
+    "Indirect Income":        "Indirect Incomes",
+    "Expenses (Direct)":      "Direct Expenses",
+    "Direct Expense":         "Direct Expenses",
+    "Expenses (Indirect)":    "Indirect Expenses",
+    "Indirect Expense":       "Indirect Expenses",
+    "Duties and Taxes":       "Duties & Taxes",
+    "Cash-in-hand":           "Cash-in-Hand",
+    "Misc. Expenses (Asset)": "Misc. Expenses (ASSET)",
+}
+
+# Tally groups whose ledgers are migrated as PARTIES (Customer/Supplier), not as
+# ledger Accounts. Their descendants are resolved at runtime from the group tree.
+PARTY_ROOT_GROUPS = DEBTOR_ROOTS | CREDITOR_ROOTS
+
+# Tally marks every top-level (primary) group/ledger with the sentinel parent
+# "Primary". It has no ERPNext equivalent - such nodes attach directly under the
+# relevant root group - so it must be normalised to "" (no parent) on extraction.
+TALLY_ROOT_PARENT = "Primary"
+
+# Tally system ledgers ERPNext derives itself (it computes its own P&L) - never
+# migrated as ledger Accounts.
+TALLY_SYSTEM_LEDGERS = {"Profit & Loss A/c"}
+_SYSTEM_LEDGERS_NORM = {norm_group(n) for n in TALLY_SYSTEM_LEDGERS}
+
+
+def is_system_ledger(name: str) -> bool:
+    """True for a Tally system ledger ERPNext maintains itself (e.g. "Profit & Loss
+    A/c"), matched case/whitespace-insensitively so a differently-cased export still
+    skips it rather than importing it as an ordinary account."""
+    return norm_group(name) in _SYSTEM_LEDGERS_NORM
+
+# Tally's explicit GST registration type → ERPNext GST Category. Tally states this
+# on the party ledger, so when present it is authoritative - unlike inferring the
+# category from the GSTIN/country, it distinguishes Composition / SEZ / consumer.
+# Unmapped/blank values fall back to GSTIN+country inference (infer_gst_category).
+GST_REGISTRATION_TYPE_MAP: dict[str, str] = {
+    "regular":             "Registered Regular",
+    "composition":         "Registered Composition",
+    "consumer":            "Unregistered",
+    "unregistered":        "Unregistered",
+    "unregistered/consumer": "Unregistered",
+    "sez":                 "SEZ",
+    "special economic zone": "SEZ",
+    "deemed export":       "Deemed Export",
+}
+
+
+def gst_category_from_type(raw: str) -> str:
+    """Map a Tally GST registration type to an ERPNext GST Category, or "" when
+    the value is blank/unrecognised (caller then falls back to inference)."""
+    key = (raw or "").strip().lower()
+    # Tally records SEZ as a compound registration type ("Regular - SEZ"), not the
+    # bare "SEZ" the exact-match table holds and not the ISSEZPARTY flag (which
+    # TallyPrime leaves "No"). Match the SEZ token anywhere so the compound form
+    # maps to the SEZ category instead of falling through to "Registered Regular".
+    if re.search(r"\bsez\b", key):
+        return "SEZ"
+    return GST_REGISTRATION_TYPE_MAP.get(key, "")
+
+# ERPNext's standard root-type representative groups, used as a last-resort parent
+# in coa_mode="reuse" when a more specific default group can't be found.
+ERPNEXT_ROOT_GROUPS: dict[str, str] = {
+    ASSET:     "Application of Funds (Assets)",
+    LIABILITY: "Source of Funds (Liabilities)",
+    INCOME:    "Income",
+    EXPENSE:   "Expenses",
+    EQUITY:    "Equity",
+}
+
+
+# Normalised-key views of the classification + alias tables, built once, so the
+# lookup is case/whitespace-insensitive (see norm_group). The aliases map a normalised
+# display variant to the normalised canonical key.
+_CLASSIFICATION_BY_NORM = {norm_group(k): v for k, v in TALLY_GROUP_CLASSIFICATION.items()}
+_ALIASES_BY_NORM = {norm_group(k): norm_group(v) for k, v in TALLY_GROUP_ALIASES.items()}
+
+
+def classify_group(name: str) -> dict | None:
+    """Return the classification for a reserved Tally group, else None.
+
+    Matching is case- and whitespace-insensitive (see norm_group) and accepts display-
+    name aliases, so "Bank Accounts", "BANK ACCOUNTS" and "bank  accounts" all resolve.
+    ``None`` means the group is user-defined and its nature must be inherited from its
+    nearest reserved ancestor.
+    """
+    key = norm_group(name)
+    key = _ALIASES_BY_NORM.get(key, key)
+    return _CLASSIFICATION_BY_NORM.get(key)

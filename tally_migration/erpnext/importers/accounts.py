@@ -1,0 +1,388 @@
+"""Chart of Accounts and Cost Centre importers."""
+
+import contextlib
+from collections import Counter
+from dataclasses import dataclass, field
+
+import frappe
+
+from tally_migration.tally.mappings import (
+    UOM_MAP,
+    TALLY_STATE_MAP,
+    DEFAULT_CUSTOMER_GROUP,
+    DEFAULT_SUPPLIER_GROUP,
+    DEFAULT_ITEM_GROUP,
+    DEFAULT_TERRITORY,
+    DEFAULT_WAREHOUSE,
+    DEFAULT_UOM,
+    ERPNEXT_ROOT_GROUPS,
+    classify_group,
+    gst_category_from_type,
+)
+from tally_migration.naming import safe_item_code, company_scoped
+from tally_migration.tally.extractors import TallyExtractor
+from tally_migration.validation.engine import (
+    infer_gst_category, validate_gstin, GSTIN_STATE_CODES,
+)
+from .base import BaseImporter, ImportResult
+from .banks import _ensure_bank, _insert_bank_account
+from tally_migration.migration import record_guard
+
+# ── Chart of Accounts importer ───────────────────────────────────────────────
+
+class AccountImporter:
+    """Creates the Chart of Accounts (groups + ledger accounts).
+
+    Two modes:
+    - ``reuse``  (default): Tally's reserved groups are NOT recreated; their
+      ERPNext standard-COA equivalents are used as parents. Only custom groups
+      and ledger accounts are created.
+    - ``mirror`` : every Tally group is recreated verbatim.
+
+    Parties (ledgers under Sundry Debtors/Creditors) are excluded upstream by the
+    extractor - they are Customers/Suppliers, not ledger Accounts.
+
+    Standalone (not a BaseImporter) because parent resolution + topological group
+    ordering don't fit the simple key_field upsert template.
+    """
+
+    doctype = "Account"
+
+    def __init__(self, company: str, abbr: str, mode: str = "reuse"):
+        self.company = company
+        self.abbr = abbr
+        self.mode = mode if mode in ("reuse", "mirror") else "reuse"
+        self._group_cache: dict[str, str] = {}
+        # Tally group name -> ERPNext parent account its children should nest under,
+        # for groups whose name collides with an existing account we must NOT convert
+        # (see _build_redirects). Empty until run() builds it.
+        self._redirect: dict[str, str] = {}
+
+    def run(self, accounts: list, on_progress=None) -> ImportResult:
+        result = ImportResult(self.doctype)
+        ordered = self._ordered(self._select(accounts))
+        # Decide up front which Tally groups collide with an existing account we must
+        # leave intact, so child parent-resolution can re-home them (order-independent).
+        self._build_redirects(ordered, result)
+        total = len(ordered)
+        # Defer the nested-set (lft/rgt) maintenance that ERPNext's Account.on_update
+        # runs on EVERY insert - the "UPDATE tabAccount SET rgt=rgt+2 WHERE rgt>=x"
+        # shuffle that grows O(n^2) with the chart and dominated this phase on a real
+        # book (60% of the phase in SQL, 14,788 queries). Account.on_update honours
+        # frappe.local.flags.ignore_update_nsm (a first-class ERPNext hook - NOT a
+        # monkeypatch); with it set, each insert skips per-record tree renumbering and
+        # we rebuild the whole tree ONCE at the end in a single O(n) pass. The full
+        # Account.validate still runs on every insert (it reads the parent's is_group,
+        # never lft/rgt), so validation is unchanged - only the numbering is batched.
+        prior_nsm = frappe.local.flags.ignore_update_nsm
+        frappe.local.flags.ignore_update_nsm = True
+        try:
+            for idx, node in enumerate(ordered, 1):
+                if on_progress:
+                    on_progress(idx, total)
+                ident = node.name
+                # Time-box each account so one pathological node (e.g. a slow India-
+                # Compliance tax-account hook) can't freeze the whole run, and skip one
+                # already confirmed-hung so a resume steps past it. This importer is
+                # standalone (not BaseImporter), so the guard is wired explicitly here,
+                # mirroring BaseImporter.run - otherwise the Accounts phase would be the
+                # one phase with no hang protection or auto-resume.
+                if record_guard.should_skip(self.doctype, ident):
+                    result.add_error(
+                        ident, "left out because it repeatedly stalled the migration "
+                        "(timed out twice); re-import this account on its own")
+                    continue
+                with record_guard.guard(self.doctype, ident):
+                    parent = self._resolve_parent(node)
+                    if not parent:
+                        result.add_error(node.name, "could not resolve a parent account")
+                        continue
+                    self._upsert(result, node, parent)
+        finally:
+            frappe.local.flags.ignore_update_nsm = prior_nsm
+            # Rebuild in finally so the committed accounts always end with a valid tree
+            # even if the loop raised or the per-record hang-guard killed the worker
+            # mid-phase: a resume re-enters run(), skips the existing accounts, and this
+            # rebuild still fires (self-healing). Only when the phase had accounts to
+            # place, so an empty/party-only run does no needless work.
+            if ordered:
+                self._rebuild_account_tree(result)
+        return result
+
+    def _rebuild_account_tree(self, result: ImportResult) -> None:
+        """Recompute every Account's lft/rgt in one pass from the parent_account
+        structure (frappe's stock ``rebuild_tree``), replacing the per-insert
+        renumbering deferred via ``ignore_update_nsm``. Idempotent, so it is safe on a
+        re-run / resume. Non-fatal: a failure is recorded so a numbering problem is
+        visible rather than leaving a silently broken tree.
+
+        Note: ``rebuild_tree`` is site-wide - it renumbers Accounts for *every* company,
+        not only this run's. That is by design (we use the stock routine rather than fork
+        a company-scoped one): it only rewrites the opaque lft/rgt ordering numbers, the
+        tree *structure* is preserved, and it writes with ``update_modified=False`` so
+        other companies' rows are not otherwise touched."""
+        try:
+            from frappe.utils.nestedset import rebuild_tree
+            rebuild_tree(self.doctype)
+            frappe.db.commit()
+        except Exception as exc:
+            frappe.db.rollback()
+            frappe.log_error("Tally Migrator", f"Account tree rebuild failed: {exc}")
+            result.add_error("(account tree rebuild)", exc)
+
+    # ── Selection + ordering ─────────────────────────────────────────────────
+    def _select(self, accounts: list) -> list:
+        if self.mode == "mirror":
+            return list(accounts)
+        # reuse: reserved groups already exist in ERPNext - don't recreate them.
+        return [a for a in accounts if not (a.is_group and a.is_reserved)]
+
+    def _ordered(self, nodes: list) -> list:
+        groups = [n for n in nodes if n.is_group]
+        ledgers = [n for n in nodes if not n.is_group]
+        return self._topo_groups(groups) + ledgers
+
+    @staticmethod
+    def _topo_groups(groups: list) -> list:
+        index = {g.name: g for g in groups}
+        ordered, visited, visiting = [], set(), set()   # visiting = cycle guard
+
+        def visit(name: str) -> None:
+            if name in visited or name not in index:
+                return
+            visiting.add(name)
+            parent = index[name].parent
+            if parent in index and parent not in visiting:
+                visit(parent)
+            visiting.discard(name)
+            visited.add(name)
+            ordered.append(index[name])
+
+        for g in groups:
+            visit(g.name)
+        return ordered
+
+    # ── Parent resolution ────────────────────────────────────────────────────
+    def _erp_name(self, base: str) -> str:
+        return company_scoped(base, self.abbr)
+
+    def _resolve_parent(self, node) -> str | None:
+        parent = node.parent
+        if not parent:
+            return self._root_group(node.root_type)
+        if parent in self._redirect:
+            # The Tally parent group's name collides with an existing account we keep
+            # as a ledger (never converted), so its children nest under that account's
+            # own parent instead - see _build_redirects. Applies in both modes: we never
+            # convert the ledger, so its children always re-home.
+            return self._redirect[parent]
+        if self.mode == "mirror":
+            return self._erp_name(parent)
+        cls = classify_group(parent)
+        if cls:  # parent is a reserved group → use its ERPNext default group
+            return self._default_group(cls["erpnext_group"], node.root_type)
+        return self._erp_name(parent)  # custom parent was (or will be) recreated
+
+    def _default_group(self, base: str, root_type: str) -> str | None:
+        if base in self._group_cache:
+            return self._group_cache[base]
+        candidate = self._erp_name(base)
+        resolved = candidate if frappe.db.exists("Account", candidate) else self._root_group(root_type)
+        if resolved:
+            self._group_cache[base] = resolved
+        return resolved
+
+    def _root_group(self, root_type: str) -> str | None:
+        base = ERPNEXT_ROOT_GROUPS.get(root_type)
+        if base:
+            candidate = self._erp_name(base)
+            if frappe.db.exists("Account", candidate):
+                return candidate
+        rows = frappe.get_all(
+            "Account", fields=["name", "parent_account"],
+            filters={"root_type": root_type, "is_group": 1, "company": self.company},
+        )
+        for r in rows:
+            if not r.get("parent_account"):
+                return r["name"]
+        return rows[0]["name"] if rows else None
+
+    def _upsert(self, result: ImportResult, node, parent: str) -> None:
+        try:
+            if frappe.db.exists("Account", self._erp_name(node.name)):
+                # The name is already taken - a re-run's own account, a reserved group,
+                # or a Tally group colliding with a standard ledger. We never convert or
+                # overwrite an existing account (it may be load-bearing - e.g. India
+                # Compliance wires "TDS Payable" into its tax-withholding setup). A
+                # colliding group's children were re-homed to the existing account's
+                # parent in _build_redirects, so here we simply skip.
+                result.skipped += 1
+                return
+            doc = {
+                "doctype": "Account",
+                "account_name": node.name,
+                "company": self.company,
+                "parent_account": parent,
+                "is_group": 1 if node.is_group else 0,
+                "root_type": node.root_type,
+            }
+            if node.account_type:
+                doc["account_type"] = node.account_type
+            d = frappe.get_doc(doc)
+            d.insert(ignore_permissions=True)
+            frappe.db.commit()
+            result.add_created(d.name)
+        except Exception as exc:
+            result.add_error(node.name, exc)
+            frappe.db.rollback()
+            return
+        # A Tally bank ledger carries the company's own account no + IFSC → create a
+        # company Bank Account linked to this GL account. Separate, non-fatal step so
+        # a Bank-Account quirk can't roll back the account that was just created.
+        if not node.is_group and node.account_type == "Bank" and node.bank_account_no:
+            self._save_company_bank_account(node, d.name, result)
+
+    def _build_redirects(self, ordered: list, result: ImportResult) -> None:
+        """Map each Tally group whose name collides with an existing *ledger* to that
+        ledger's parent group, so the group's children nest there instead.
+
+        A Tally custom group ("OFFICE EQUIPMENT", "TDS PAYABLE") can share a name -
+        case-insensitively, the way MariaDB compares - with an account ERPNext already
+        ships as a ledger ("Office Equipment"; "TDS Payable", a Tax account India
+        Compliance wires into every Tax Withholding Category). We must NOT convert that
+        ledger to a group: converting strips its load-bearing role and breaks the
+        features that depend on it (opening entries, IC tax withholding, company
+        defaults). Instead we leave the ledger exactly as it is and re-home the Tally
+        group's sub-accounts to the ledger's own parent group - so every sub-account
+        still imports, one level flatter, and nothing standard is mutated.
+
+        Builds ``self._redirect`` (Tally group name -> ERPNext parent account name).
+        ``_resolve_parent`` consults it; ``_upsert`` then skips the colliding group
+        itself (its name is taken by the ledger we are keeping)."""
+        self._redirect = {}
+        for node in ordered:
+            if not node.is_group:
+                continue
+            existing = frappe.db.get_value(
+                "Account", self._erp_name(node.name),
+                ["name", "is_group", "parent_account", "root_type"], as_dict=True)
+            if not existing or existing.is_group:
+                continue  # free to create, or an existing group we can nest under
+            target = existing.parent_account or self._root_group(
+                existing.root_type or node.root_type)
+            if not target:
+                continue  # no safe parent to re-home under; let _upsert skip + warn-free
+            self._redirect[node.name] = target
+            result.add_warning(
+                node.name,
+                f"a Tally group with this name matches the existing account "
+                f"'{existing.name}', which is kept as a ledger (converting it would "
+                f"break ERPNext features that rely on it). Its sub-accounts were placed "
+                f"under '{target}' instead.")
+
+    def _save_company_bank_account(self, node, account_name: str,
+                                   result: ImportResult) -> None:
+        bank = _ensure_bank(node.bank_name, result, is_company=True)
+        if not bank:
+            result.add_warning(
+                node.name, "bank account not created: no bank name on the ledger")
+            return
+        _insert_bank_account(
+            account_name=node.bank_holder or node.name,
+            bank=bank,
+            account_no=node.bank_account_no,
+            ifsc=node.bank_ifsc,
+            gl_account=account_name,        # link to the GL account just created
+            company=self.company,           # same company the GL account was created under
+            is_company=True,
+            result=result,
+            warn_name=node.name,
+            count_created=True,
+        )
+
+
+# ── Cost Centre importer ─────────────────────────────────────────────────────
+
+class CostCentreImporter:
+    """Creates Cost Centers (flat or nested) under the company's root centre."""
+
+    doctype = "Cost Center"
+
+    def __init__(self, company: str, abbr: str):
+        self.company = company
+        self.abbr = abbr
+
+    def run(self, centres: list) -> ImportResult:
+        result = ImportResult(self.doctype)
+        names = {c.name for c in centres}
+        parents = {c.parent for c in centres if c.parent}
+        root = self._root_centre()
+        if not root:
+            for c in centres:
+                result.add_error(c.name, "no root cost center found in ERPNext")
+            return result
+        for node in self._ordered(centres):
+            ident = node.name
+            # Same per-record hang guard as the account loop above (this importer is also
+            # standalone), so a stalled cost centre is time-boxed and skipped on resume.
+            if record_guard.should_skip(self.doctype, ident):
+                result.add_error(
+                    ident, "left out because it repeatedly stalled the migration "
+                    "(timed out twice); re-import this cost centre on its own")
+                continue
+            with record_guard.guard(self.doctype, ident):
+                parent = self._erp_name(node.parent) if node.parent in names else root
+                self._upsert(result, node, node.name in parents, parent)
+        return result
+
+    def _erp_name(self, base: str) -> str:
+        return company_scoped(base, self.abbr)
+
+    @staticmethod
+    def _ordered(centres: list) -> list:
+        index = {c.name: c for c in centres}
+        ordered, visited, visiting = [], set(), set()   # visiting = cycle guard
+
+        def visit(name: str) -> None:
+            if name in visited or name not in index:
+                return
+            visiting.add(name)
+            parent = index[name].parent
+            if parent in index and parent not in visiting:
+                visit(parent)
+            visiting.discard(name)
+            visited.add(name)
+            ordered.append(index[name])
+
+        for c in centres:
+            visit(c.name)
+        return ordered
+
+    def _root_centre(self) -> str | None:
+        rows = frappe.get_all(
+            "Cost Center", fields=["name", "parent_cost_center"],
+            filters={"company": self.company, "is_group": 1},
+        )
+        for r in rows:
+            if not r.get("parent_cost_center"):
+                return r["name"]
+        return rows[0]["name"] if rows else None
+
+    def _upsert(self, result: ImportResult, node, is_group: bool, parent: str) -> None:
+        try:
+            if frappe.db.exists("Cost Center", self._erp_name(node.name)):
+                result.skipped += 1
+                return
+            d = frappe.get_doc({
+                "doctype": "Cost Center",
+                "cost_center_name": node.name,
+                "parent_cost_center": parent,
+                "company": self.company,
+                "is_group": 1 if is_group else 0,
+            })
+            d.insert(ignore_permissions=True)
+            frappe.db.commit()
+            result.add_created(d.name)
+        except Exception as exc:
+            result.add_error(node.name, exc)
+            frappe.db.rollback()

@@ -83,7 +83,11 @@ app_license = "mit"
 # ------------
 
 # before_install = "tally_migration.install.before_install"
-# after_install = "tally_migration.install.after_install"
+
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
+# The "Tally Migration Manager" role is created in after_install (single source
+# of truth). Page/DocType permissions reference it declaratively.
+after_install = "tally_migration.install.after_install"
 
 # Uninstallation
 # ------------
@@ -145,26 +149,15 @@ app_license = "mit"
 # 	}
 # }
 
-# Scheduled Tasks
-# ---------------
-
-# scheduler_events = {
-# 	"all": [
-# 		"tally_migration.tasks.all"
-# 	],
-# 	"daily": [
-# 		"tally_migration.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"tally_migration.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"tally_migration.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"tally_migration.tasks.monthly"
-# 	],
-# }
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+# Auto-resume a run that a per-record hang hard-killed: the guard leaves an in-flight
+# marker, this sweep re-enqueues the run so it steps past the culprit. Idempotent and
+# capped (see resume.py / record_guard.py), so it is safe to run frequently.
+scheduler_events = {
+    "cron": {
+        "*/5 * * * *": ["tally_migration.migration.resume.resume_stalled_runs"],
+    }
+}
 
 # Testing
 # -------
