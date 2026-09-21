@@ -145,7 +145,7 @@ def _opening_date_issues(company: str, posting_date: str) -> list:
     frozen = None
     if frappe.db.has_column("Company", "accounts_frozen_till_date"):
         frozen = frappe.db.get_value("Company", company, "accounts_frozen_till_date")
-    elif frappe.db.has_column("Accounts Settings", "acc_frozen_upto"):
+    elif frappe.get_meta("Accounts Settings").has_field("acc_frozen_upto"):
         frozen = frappe.db.get_single_value("Accounts Settings", "acc_frozen_upto")
     if frozen and str(date) <= str(frozen):
         issues.append(_issue(
