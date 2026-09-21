@@ -33,7 +33,7 @@ Every imported voucher carries its Tally GUID and Voucher Number for traceabilit
 
 ## Requirements
 
-- ERPNext v15 (`>=15.0.0,<16.0.0`)
+- ERPNext v16 (`>=16.0.0,<17.0.0`)
 - Python >= 3.10
 - Users need the **Tally Migration Manager** role (created on install) or System Manager
 
