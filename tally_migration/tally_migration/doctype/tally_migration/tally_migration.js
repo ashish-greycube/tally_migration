@@ -44,6 +44,10 @@ frappe.ui.form.on("Tally Migration", {
     },
 
     refresh: function (frm) {
+        frm.set_intro(
+            __("This legacy importer is deprecated. Use the Tally Migrator page for new master and accounting-only Day Book imports."),
+            "orange"
+        );
         frm.trigger("show_logs_preview");
         erpnext.tally_migration.failed_import_log = JSON.parse(frm.doc.failed_import_log);
         erpnext.tally_migration.fixed_errors_log = JSON.parse(frm.doc.fixed_errors_log);

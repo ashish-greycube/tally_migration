@@ -1,0 +1,1159 @@
+import hashlib
+import json
+import re
+import threading
+from collections import OrderedDict
+from urllib.parse import urlparse
+
+import frappe
+
+from tally_migration.tally.config import TallyConfig
+from tally_migration.tally.file_source import FileTallySource, decode_tally_bytes, unzip_if_zip
+from tally_migration.tally.extractors import TallyExtractor, ITEM_FIELDS, ITEM_TAGS
+from tally_migration.erpnext.uom_resolver import UomResolver
+from tally_migration.validation.engine import (
+    validate_extraction, group_report, records_by_key, erpnext_states,
+)
+from tally_migration.migration.overrides import apply_record_overrides
+from tally_migration.migration.coverage import coverage_report
+from tally_migration.migration.account_mapping import account_mapping
+from tally_migration.migration.readiness import check_readiness
+from tally_migration.migration.master_migrator import MasterMigrator
+from tally_migration.migration.transaction_migrator import (
+    TransactionMigrator,
+    create_transaction_log,
+    masters_opening_date,
+)
+from tally_migration.tally.daybook import parse_daybook
+
+ALLOWED_ROLES = ["System Manager", "Tally Migration Manager"]
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def preview_masters_file(file_url: str):
+    """Parse an uploaded Tally Masters XML and report what it contains.
+
+    Read-only: imports nothing. Lets the user confirm the file is valid and see
+    record counts (customers / suppliers / items / warehouses) *before* running
+    the migration, so there are no surprises.
+
+    Status-wrapped exactly like ``validate_masters_data`` so a large export can never
+    time the web request out: a small plain file is counted inline ('ready'); a large
+    file (or a zip / remote link) is counted once in a background job and cached in
+    Redis - 'running' while it computes, then 'ready' with the counts or 'failed' with a
+    reason. The wizard polls this endpoint until it leaves 'running'. A failure is
+    reported honestly, never as an empty (zero-count) 'ready'.
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    file_doc = _resolve_file_doc(file_url)
+    _assert_file_access(file_doc)
+    # Small file: count inline (fast, no timeout risk).
+    if not _should_run_async(file_doc):
+        try:
+            return {"status": "ready", **_compute_preview(file_url)}
+        except Exception as exc:
+            frappe.log_error(f"preview (inline) failed: {exc}", "Tally Migrator")
+            return {"status": "failed", "error": _preflight_error_message(exc)}
+
+    # Large file: the parse can exceed the web request timeout, so count it once in a
+    # background job and cache the result (shared across workers). The wizard polls.
+    key = _preview_key(file_doc)
+    cached = frappe.cache().get_value(key)
+    if cached:
+        return cached
+    # Mark running before enqueuing so concurrent polls don't each enqueue; the
+    # key-derived job_id + deduplicate close the double-enqueue window. On 'default'
+    # (not 'short'): a large-book parse can run for minutes, which the short queue
+    # is not for.
+    frappe.cache().set_value(key, {"status": "running"}, expires_in_sec=_PREFLIGHT_TTL)
+    try:
+        frappe.enqueue(
+            "tally_migration.api._run_preview_job", queue="default", timeout=30 * 60,
+            job_id=f"preview::{key}", deduplicate=True,
+            key=key, file_url=file_url)
+    except Exception:
+        # The enqueue itself can fail (e.g. the background queue is saturated - a real,
+        # observed condition on big books). Don't strand the 'running' marker for its full
+        # TTL, or every later poll reads 'running' and the wizard shows a valid file as
+        # unreadable with no way to retry. Clear it so the next attempt re-enqueues.
+        frappe.cache().delete_value(key)
+        raise
+    return {"status": "running"}
+
+
+def _preview_key(file_doc) -> str:
+    """Redis key for a preview result, unique to the file version and the user. Unlike
+    the pre-flight key it depends on neither company nor inline edits (the preview shows
+    only raw record counts), so re-entering the upload step reuses the same result and a
+    new upload (new File / modified) never serves a stale one."""
+    h = hashlib.sha1(
+        f"{file_doc.name}|{file_doc.modified}|{frappe.session.user}".encode()).hexdigest()
+    return f"tally_preview:{h}"
+
+
+def _compute_preview(file_url) -> dict:
+    """The upload-step record counts (customers / suppliers / items / warehouses /
+    accounts), from a single parse. Writes nothing."""
+    _, source = _source_from_file(file_url)
+    extractor = TallyExtractor(source)
+    masters = extractor.extract_all()
+    return {
+        **masters.summary,
+        **extractor.extract_coa().summary,
+        "source_company": masters.source_company,
+        "excluded_party_names": [row["_name"] for row in masters.excluded_parties],
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def preview_daybook_file(file_url: str) -> dict:
+    """Validate a Day Book file and return voucher counts without importing it."""
+    frappe.only_for(ALLOWED_ROLES)
+    file_doc = _resolve_file_doc(file_url)
+    _assert_file_access(file_doc)
+    raw = unzip_if_zip(_raw_file_bytes(file_doc), _max_upload_bytes())
+    return parse_daybook(raw).summary
+
+
+@frappe.whitelist(methods=["POST"])
+def daybook_date_check(file_url: str, erpnext_company: str) -> dict:
+    """Compare Day Book voucher dates with the company's Masters opening-balance date.
+
+    Opening balances already carry every transaction up to that date, so a voucher dated
+    before it would be counted twice. Read-only. ``opening_date`` is None when no Masters
+    import with an opening date exists for the company."""
+    frappe.only_for(ALLOWED_ROLES)
+    file_doc = _resolve_file_doc(file_url)
+    _assert_file_access(file_doc)
+    opening = masters_opening_date(erpnext_company)
+    raw = unzip_if_zip(_raw_file_bytes(file_doc), _max_upload_bytes())
+    dates = sorted(
+        v["posting_date"] for v in parse_daybook(raw).vouchers
+        if not v["cancelled"] and not v["has_inventory"] and v["posting_date"])
+    before = [d for d in dates if opening and d < opening]
+    return {
+        "opening_date": opening,
+        "first_voucher": dates[0] if dates else None,
+        "last_voucher": dates[-1] if dates else None,
+        "before_count": len(before),
+        "total": len(dates),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def run_daybook_migration_from_file(file_url: str, erpnext_company: str) -> dict:
+    """Queue an accounting-only Day Book import for an existing Company."""
+    frappe.only_for(ALLOWED_ROLES)
+    if not frappe.db.exists("Company", erpnext_company):
+        frappe.throw(frappe._("Select a valid ERPNext Company."))
+    _assert_no_active_run(erpnext_company)
+    file_doc = _resolve_file_doc(file_url)
+    _assert_file_access(file_doc)
+
+    log = create_transaction_log(erpnext_company, file_url, file_doc.file_name)
+    job_id = f"tally-daybook-{log.name}"
+    log.db_set("job_id", job_id, commit=True)
+    frappe.enqueue(
+        "tally_migration.api._run_daybook_job",
+        queue="long",
+        timeout=4 * 60 * 60,
+        enqueue_after_commit=True,
+        job_id=job_id,
+        file_url=file_url,
+        erpnext_company=erpnext_company,
+        log_name=log.name,
+    )
+    return {"enqueued": True, "log_name": log.name, "company": erpnext_company}
+
+
+def _run_daybook_job(file_url: str, erpnext_company: str, log_name: str) -> None:
+    file_doc = _resolve_file_doc(file_url)
+    raw = unzip_if_zip(_raw_file_bytes(file_doc), _max_upload_bytes())
+    log = frappe.get_doc("Tally Migration Log", log_name)
+    TransactionMigrator(erpnext_company, raw, log).run()
+
+
+def _run_preview_job(key, file_url):
+    """Background worker: count the file once and cache the result (or a failure), so the
+    polling wizard picks it up. Off the web request, so a large file can't time it out."""
+    try:
+        payload = _compute_preview(file_url)
+        frappe.cache().set_value(
+            key, {"status": "ready", **payload}, expires_in_sec=_PREFLIGHT_TTL)
+    except Exception as exc:
+        frappe.log_error(f"preview job failed: {exc}", "Tally Migrator")
+        # Cache the failure (short TTL) so the wizard shows 'couldn't read' instead of
+        # polling forever, and a retry can recompute soon.
+        frappe.cache().set_value(
+            key, {"status": "failed", "error": _preflight_error_message(exc)},
+            expires_in_sec=120)
+        raise
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def validate_masters_file(file_url: str):
+    """Pre-flight check: find UOMs used in the file that don't exist in ERPNext.
+
+    Returns a list of issues (one per unique Tally UOM that maps to a missing
+    ERPNext UOM) and the full list of existing ERPNext UOMs so the frontend
+    can render a resolution dropdown. Read-only - creates nothing.
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    _, source = _source_from_file(file_url)
+    items = source.get_collection("Stock Item", ITEM_FIELDS, ITEM_TAGS)
+    resolver = UomResolver(
+        u["name"] for u in frappe.get_all("UOM", fields=["name"], limit_page_length=0)
+    )
+    return {
+        "issues": resolver.issues_for(r.get("BaseUnits") for r in items),
+        "all_uoms": resolver.existing_sorted,
+    }
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def get_companies():
+    """List ERPNext companies for the wizard's target-company picker.
+
+    The wizard runs under the Tally Migration Manager role, which deliberately
+    holds no Company read permission (it only needs to migrate, not browse the
+    Company master). A plain ``frappe.client.get_list`` would therefore return
+    nothing. This gated endpoint returns the names with ``ignore_permissions`` so
+    the picker works without widening the role.
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    return frappe.get_all(
+        "Company", fields=["name"], order_by="name", ignore_permissions=True
+    )
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def company_readiness(erpnext_company: str = "", posting_date: str = ""):
+    """Pre-flight: is the target ERPNext company set up to receive masters?
+
+    Read-only. Returns blockers (an entire entity would fail) and warnings
+    (partial degradation) so the UI can stop a doomed run before it starts.
+    ``posting_date`` (optional) is checked against frozen periods / fiscal years.
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    return check_readiness(erpnext_company, posting_date)
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def validate_masters_data(file_url: str, record_overrides: str = "", erpnext_company: str = "",
+                          posting_date: str = ""):
+    """Pre-flight data-quality scan of an uploaded Tally Masters XML.
+
+    Read-only - extracts and inspects, writes nothing. Returns a grouped,
+    UI-ready report (issues collapsed by rule code, errors first) plus the inline
+    editor metadata (editable fields + current values + the state list) so the user
+    can fix flagged fields and decide (fix / proceed anyway) before any migration.
+
+    ``record_overrides`` is the JSON of edits made on the screen so far; they are
+    applied in memory before re-validating, so "Re-check" confirms fixes against
+    the same rules. The uploaded file itself is never modified.
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    file_doc = _resolve_file_doc(file_url)
+    _assert_file_access(file_doc)
+    # Small file: compute inline (fast, no timeout risk). Any failure is reported
+    # honestly as 'failed' - the wizard blocks - never as a silent empty 'clean'.
+    if not _should_run_async(file_doc):
+        try:
+            return {"status": "ready", **_compute_preflight(
+                file_url, record_overrides, erpnext_company, posting_date)}
+        except Exception as exc:
+            frappe.log_error(f"preflight (inline) failed: {exc}", "Tally Migrator")
+            return {"status": "failed", "error": _preflight_error_message(exc)}
+
+    # Large file: the scan (parse + extract + validate + coverage + mapping) can exceed
+    # the web request timeout, so compute it once in a background job and cache the
+    # result in Redis (shared across workers, so a cold worker never re-parses). The
+    # wizard polls this endpoint until 'ready' or 'failed'.
+    key = _preflight_key(file_doc, record_overrides, erpnext_company, posting_date)
+    cached = frappe.cache().get_value(key)
+    if cached:
+        return cached
+    # Mark running first so concurrent polls don't each enqueue, then enqueue. On the
+    # 'default' queue, not 'short': this parse can run for minutes on a large book (that
+    # is why it is async at all), and the short queue is meant for sub-second tasks -
+    # parking a long parse there would starve it. deduplicate + a key-derived job_id
+    # closes the small window where two near-simultaneous first polls could both enqueue.
+    frappe.cache().set_value(key, {"status": "running"}, expires_in_sec=_PREFLIGHT_TTL)
+    try:
+        frappe.enqueue(
+            "tally_migration.api._run_preflight_job", queue="default", timeout=30 * 60,
+            job_id=f"preflight::{key}", deduplicate=True,
+            key=key, file_url=file_url, record_overrides=record_overrides,
+            erpnext_company=erpnext_company, posting_date=posting_date)
+    except Exception:
+        # See preview_masters_file: a failed enqueue must not strand the 'running' marker,
+        # or the wizard polls a good file forever and reports it unreadable. Clear it so a
+        # retry re-enqueues.
+        frappe.cache().delete_value(key)
+        raise
+    return {"status": "running"}
+
+
+# Seconds a computed preflight result stays cached (keyed by file version + edits +
+# company + date + user), long enough to cover a wizard session's polling and review.
+_PREFLIGHT_TTL = 3600
+
+
+def _preflight_key(file_doc, record_overrides, erpnext_company, posting_date) -> str:
+    """Redis key for a preflight result, unique to the file version, the user's inline
+    edits, the target company/date, and the user - so an edit ('Re-check') or a new
+    upload never serves a stale result, and one user's scan can't leak to another."""
+    h = hashlib.sha1(
+        f"{file_doc.name}|{file_doc.modified}|{record_overrides}|{erpnext_company}"
+        f"|{posting_date}|{frappe.session.user}".encode()).hexdigest()
+    return f"tally_preflight:{h}"
+
+
+def _compute_preflight(file_url, record_overrides, erpnext_company, posting_date) -> dict:
+    """The full read-only pre-flight scan - data-quality + UOM + coverage + account
+    mapping + readiness - from a single parse. Writes nothing. Folding the UOM scan in
+    here means the wizard gets everything from one parse and one call (previously two
+    parallel calls, each re-parsing on a cold worker)."""
+    overrides = json.loads(record_overrides) if record_overrides else {}
+    _, source = _source_from_file(file_url)
+    extractor = TallyExtractor(source)
+    masters = apply_record_overrides(extractor.extract_all(), overrides)
+    # COA is extracted too so hierarchy checks (cycles) can cover accounts and cost
+    # centres, not just the inventory masters carried on ``masters``.
+    coa = extractor.extract_coa()
+    payload = group_report(
+        validate_extraction(masters=masters, coa=coa), records_by_key(masters))
+    payload["states"] = erpnext_states()
+    payload["coverage"] = coverage_report(source)
+    payload["account_mapping"] = account_mapping(source, erpnext_company)
+    if erpnext_company:
+        payload["readiness"] = check_readiness(erpnext_company, posting_date)
+    items = source.get_collection("Stock Item", ITEM_FIELDS, ITEM_TAGS)
+    resolver = UomResolver(
+        u["name"] for u in frappe.get_all("UOM", fields=["name"], limit_page_length=0))
+    payload["uom_issues"] = resolver.issues_for(r.get("BaseUnits") for r in items)
+    payload["all_uoms"] = resolver.existing_sorted
+    return payload
+
+
+def _run_preflight_job(key, file_url, record_overrides, erpnext_company, posting_date):
+    """Background worker: compute the pre-flight scan once and cache the result (or a
+    failure), so the polling wizard picks it up. Off the web request, so a large file's
+    scan can't time the request out."""
+    try:
+        payload = _compute_preflight(file_url, record_overrides, erpnext_company, posting_date)
+        frappe.cache().set_value(
+            key, {"status": "ready", **payload}, expires_in_sec=_PREFLIGHT_TTL)
+    except Exception as exc:
+        frappe.log_error(f"preflight job failed: {exc}", "Tally Migrator")
+        # Cache the failure (short TTL) so the wizard shows 'couldn't validate' instead
+        # of polling forever, and a retry can recompute soon.
+        frappe.cache().set_value(
+            key, {"status": "failed", "error": _preflight_error_message(exc)},
+            expires_in_sec=120)
+        raise
+
+
+def _preflight_error_message(exc) -> str:
+    """A short, user-facing reason the scan failed - no stack or internals."""
+    msg = str(exc).strip()
+    return msg[:200] if msg else "the file could not be read or validated"
+
+
+@frappe.whitelist(methods=["POST"])
+def create_uoms(uom_names: str):
+    """Batch-create UOM records that don't already exist.
+
+    Called from the pre-flight check screen when the user opts to create one or
+    more missing Units of Measure. One round-trip for the whole batch (scales to
+    hundreds of units), instead of one insert per row from the browser.
+
+    ``uom_names`` is a JSON list of names. Returns
+    ``{created: [...], existing: [...], failed: {name: reason}}``.
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    names = json.loads(uom_names) if isinstance(uom_names, str) else (uom_names or [])
+
+    created, existing, failed = [], [], {}
+    for raw in names:
+        name = (raw or "").strip()
+        if not name:
+            continue
+        if frappe.db.exists("UOM", name):
+            existing.append(name)
+            continue
+        try:
+            doc = frappe.new_doc("UOM")
+            doc.uom_name = name
+            doc.insert(ignore_permissions=True)
+            created.append(name)
+        except Exception as exc:
+            failed[name] = str(exc)
+    frappe.db.commit()
+    return {"created": created, "existing": existing, "failed": failed}
+
+
+# ── Wizard draft (resume an in-progress migration after reload/logout) ──────────
+
+_DRAFT_DOCTYPE = "Tally Migration Draft"
+
+# The wizard's internal code (also its data-import-type attribute) vs. the
+# Draft doctype's Select options (its labels must exactly match those options,
+# which are capitalised for display - a raw "masters" fails Select validation).
+_IMPORT_TYPE_LABELS = {"masters": "Masters", "daybook": "Day Book"}
+_IMPORT_TYPE_CODES = {v: k for k, v in _IMPORT_TYPE_LABELS.items()}
+
+
+@frappe.whitelist(methods=["POST"])
+def save_draft(payload: str):
+    """Upsert the current user's in-progress wizard state (one draft per user).
+
+    The wizard autosaves here after every inline fix / step change so an accidental
+    reload or logout doesn't lose the user's work. Stores only references + the
+    user's own edits (file URL, company, options, UOM + record overrides, step).
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    data = json.loads(payload) if isinstance(payload, str) else (payload or {})
+    if not data.get("file_url"):
+        return {"saved": False}        # nothing meaningful to persist yet
+
+    user = frappe.session.user
+    name = frappe.db.exists(_DRAFT_DOCTYPE, user)
+    doc = (frappe.get_doc(_DRAFT_DOCTYPE, name) if name
+           else frappe.new_doc(_DRAFT_DOCTYPE))
+    doc.user = user
+    doc.file_url = data.get("file_url") or ""
+    doc.file_name = data.get("file_name") or ""
+    doc.import_type = _IMPORT_TYPE_LABELS.get(data.get("import_type"), "Masters")
+    doc.erpnext_company = data.get("erpnext_company") or ""
+    doc.coa_mode = data.get("coa_mode") or ""
+    doc.posting_date = data.get("posting_date") or ""
+    doc.step = data.get("step") or ""
+    doc.uom_overrides = frappe.as_json(data.get("uom_overrides") or {})
+    doc.record_overrides = frappe.as_json(data.get("record_overrides") or {})
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"saved": True}
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def get_draft():
+    """Return the current user's saved wizard draft, or ``None`` if there is none."""
+    frappe.only_for(ALLOWED_ROLES)
+    name = frappe.db.exists(_DRAFT_DOCTYPE, frappe.session.user)
+    if not name:
+        return None
+    d = frappe.get_doc(_DRAFT_DOCTYPE, name)
+    # Only offer a resume if the uploaded file still exists - a draft pointing at a
+    # deleted File is stale and would just fail on resume.
+    if not d.file_url or not frappe.db.exists("File", {"file_url": d.file_url}):
+        return None
+    return {
+        "file_url": d.file_url,
+        "file_name": d.file_name,
+        "import_type": _IMPORT_TYPE_CODES.get(d.import_type, "masters"),
+        "erpnext_company": d.erpnext_company,
+        "coa_mode": d.coa_mode,
+        "posting_date": d.posting_date,
+        "step": d.step,
+        "uom_overrides": json.loads(d.uom_overrides or "{}"),
+        "record_overrides": json.loads(d.record_overrides or "{}"),
+        "modified": str(d.modified),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def clear_draft():
+    """Delete the current user's wizard draft (on 'start over' or after a run)."""
+    frappe.only_for(ALLOWED_ROLES)
+    name = frappe.db.exists(_DRAFT_DOCTYPE, frappe.session.user)
+    if name:
+        frappe.delete_doc(_DRAFT_DOCTYPE, name, ignore_permissions=True)
+        frappe.db.commit()
+    return {"cleared": True}
+
+
+@frappe.whitelist(methods=["POST"])
+def run_masters_migration_from_file(file_url: str, erpnext_company: str = "", uom_overrides: str = "",
+                                    validation_report: str = "", record_overrides: str = "",
+                                    coa_mode: str = "reuse", posting_date: str = "",
+                                    created_uoms: str = ""):
+    """Run the masters migration from an uploaded Tally masters XML export.
+
+    ``file_url``        - URL of the File uploaded via the standard Frappe uploader.
+    ``erpnext_company`` - target Company inside ERPNext.
+    ``uom_overrides``   - JSON object ``{"TallyUOM": "ERPNextUOM", ...}`` resolved
+                          by the user in the pre-flight check. Takes precedence over
+                          the built-in UOM_MAP for the listed keys.
+
+    The pipeline (Warehouses → Customers → Suppliers → Items) publishes progress
+    on the realtime bus and returns a summary dict that includes ``log_name`` so
+    the UI can link directly to the migration log.
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    _assert_no_active_run(erpnext_company)
+    uom: dict = json.loads(uom_overrides) if uom_overrides else {}
+    records: dict = json.loads(record_overrides) if record_overrides else {}
+    created: list = json.loads(created_uoms) if created_uoms else []
+
+    # Decide sync-vs-background on the file's *size* (cheap metadata) before parsing,
+    # so a large import never has to be parsed inside the web request at all: above the
+    # threshold we create the log and hand the run to a background worker - which does
+    # the single parse and computes the coverage/mapping reports - returning
+    # immediately. The page then tracks the log to completion (progress still streams
+    # over the realtime bus). A large import can run longer than the proxy/gunicorn
+    # timeout, so this also keeps the request from timing out.
+    file_doc = _resolve_file_doc(file_url)
+    if _should_run_async(file_doc):
+        return _enqueue_masters_run(
+            file_url, file_doc.file_name, erpnext_company, uom_overrides or "",
+            validation_report or "", record_overrides or "", coa_mode, posting_date or "",
+            created_uoms or "")
+    # Small upload: parse + run synchronously and return the full summary in one
+    # round-trip.
+    source = _source_from_file(file_url)[1]
+    config = _build_masters_config(
+        file_url, file_doc.file_name, erpnext_company, source,
+        validation_report, coa_mode, posting_date)
+    return _run_and_summarize(config, source, uom, records, created)
+
+
+@frappe.whitelist(methods=["POST"])
+def rerun_from_log(log_name: str):
+    """Re-run a migration from the source file stored on an existing log.
+
+    The import is idempotent - records that already exist are skipped - so a full
+    re-run effectively retries only the records that failed last time (typically
+    once their underlying issue, e.g. a missing UOM, has been resolved). A fresh
+    log is created so the run history is preserved.
+    """
+    frappe.only_for(ALLOWED_ROLES)
+    log = frappe.get_doc("Tally Migration Log", log_name)
+    _assert_no_active_run(log.company)
+    if not log.source_file:
+        frappe.throw(
+            "This log has no source file stored, so it can't be re-run automatically. "
+            "Open the Tally Migrator page and upload the file again."
+        )
+
+    if log.migration_type == "Transactions":
+        return run_daybook_migration_from_file(log.source_file, log.company)
+
+    _, source = _source_from_file(log.source_file)
+    config = TallyConfig(
+        erpnext_company=log.company,
+        tally_company=log.tally_company,
+        source_file=log.source_file,
+        validation_report=log.validation_report or "",
+        # Recomputed from the (unchanged) source so the new log's coverage is current.
+        coverage_report=frappe.as_json(coverage_report(source)),
+        mapping_report=frappe.as_json(account_mapping(source, log.company)),
+        # Repeat the original run's options rather than silently reverting to
+        # defaults (reuse / fiscal-year start).
+        coa_mode=log.coa_mode or "reuse",
+        posting_date=str(log.posting_date or ""),
+    )
+    # Replay the user's original pre-flight choices, or the re-run silently reverts
+    # custom UOMs to defaults and drops every inline GST/state/HSN fix that made the
+    # first run viable.
+    uom = json.loads(log.uom_overrides) if log.get("uom_overrides") else {}
+    records = json.loads(log.record_overrides) if log.get("record_overrides") else {}
+    return _run_and_summarize(config, source, uom, records)
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+# LRU of recently-parsed sources, keyed by (user, File name, modified timestamp). The
+# wizard re-calls validate/preview on every inline fix ("Re-check"), each of which
+# would otherwise re-read, re-decode, re-sanitize and re-parse the whole file. The
+# File's bytes are immutable for a given (name, modified), so a cached parse is
+# always valid; a new upload (new name) or an edit (new modified) misses and
+# re-parses. The key includes the user so one person's upload can never hand another
+# person's request a different file's parse.
+#
+# Bounded to ``_SOURCE_CACHE_MAX`` entries (least-recently-used evicted): a single
+# slot meant two managers migrating at once - or one user re-checking two files -
+# kept evicting each other and re-parsing a large file on every call. A handful of
+# entries removes that thrash; the cap still limits how much parsed data can pin
+# memory (worst case ~_SOURCE_CACHE_MAX large files), so it stays a small number.
+#
+# The cache is a process global shared by every worker thread, so all access goes
+# through ``_SOURCE_CACHE_LOCK``: without it two concurrent requests could mutate the
+# ordering / evict mid-read.
+_SOURCE_CACHE: "OrderedDict" = OrderedDict()
+_SOURCE_CACHE_LOCK = threading.Lock()
+_SOURCE_CACHE_MAX = 4
+
+# Reject uploads above this size before parsing, with an actionable message,
+# rather than letting a multi-gigabyte file exhaust the worker. UTF-16 exports
+# decode to roughly half this many characters. The default is set to comfortably
+# cover a real-world large Tally book (these routinely run 200-400 MB uncompressed)
+# so a typical export imports without any per-site tuning; a heavier worker can
+# raise it, and a memory-constrained one can lower it, via site config
+# (``tally_migration_max_upload_mb``). Note this also bounds the uncompressed size
+# of a zipped upload (the zip-bomb guard), so both paths share one ceiling.
+_DEFAULT_MAX_UPLOAD_MB = 1024
+
+# A run above this *upload size* is handed to a background job instead of blocking
+# the web request. We decide on the file's size (cheap metadata), not a record count,
+# so the run endpoint never has to parse the document just to choose - the worker does
+# the single parse. Below it, the run stays synchronous and returns the summary
+# directly. Overridable via site config (``tally_migration_async_threshold_mb``).
+_DEFAULT_ASYNC_THRESHOLD_MB = 15
+
+
+def _async_threshold_bytes() -> int:
+    mb = frappe.conf.get("tally_migration_async_threshold_mb") or _DEFAULT_ASYNC_THRESHOLD_MB
+    return int(mb) * 1024 * 1024
+
+
+def _should_run_async(file_doc) -> bool:
+    """Decide background-vs-synchronous from the File's metadata alone - no read, no
+    parse. Background when:
+
+    - the file is a remote (Google Drive) link: its real size is unknown until the
+      worker downloads it, and Drive is used precisely for large exports; or
+    - it is a ``.zip``: zips are used to fit a large export under the upload limit, so
+      the compressed ``file_size`` understates the work - always defer; or
+    - a plain upload whose ``file_size`` exceeds the threshold.
+
+    A small plain upload stays synchronous (fast parse, immediate summary)."""
+    if getattr(file_doc, "is_remote_file", False):
+        return True
+    name = (getattr(file_doc, "file_name", "") or getattr(file_doc, "file_url", "") or "").lower()
+    if name.endswith(".zip"):
+        return True
+    return (file_doc.file_size or 0) > _async_threshold_bytes()
+
+# A 'Running' log older than this is treated as stale (its worker likely died
+# without finalising), so it no longer blocks a fresh run - otherwise a crashed run
+# would lock the company out forever. The per-company opening lock (importers) is
+# the real double-post guard; this guard is an early, clearer message for the
+# common two-tab / double-click mistake.
+_ACTIVE_RUN_STALE_SECONDS = 2 * 60 * 60
+
+
+def _is_job_alive(job_id: str) -> bool:
+    """Is the RQ job for an enqueued run still queued or running?
+
+    Wraps Frappe's ``is_job_enqueued`` defensively: if RQ/Redis can't be reached we
+    return True (assume alive) so a transient lookup failure can't wave through a
+    genuine concurrent run - the duplicate-start guard fails closed."""
+    try:
+        from frappe.utils.background_jobs import is_job_enqueued
+        return is_job_enqueued(job_id)
+    except Exception:
+        return True
+
+
+def _active_run_log(company: str) -> dict | None:
+    """The live 'Running' migration log for a company, or None when none is active.
+
+    A stale run (crashed worker) is treated as not-active so re-runs aren't locked
+    out. For an async run we ask RQ whether the worker is genuinely still alive; for
+    a sync run (no job id, request-bound) we fall back to an age cap. Shared by the
+    start guard and the ``active_run`` endpoint so both judge "is a run live" the
+    same way."""
+    if not company:
+        return None
+    rows = frappe.get_all(
+        "Tally Migration Log",
+        filters={"company": company, "status": "Running"},
+        fields=["name", "modified", "job_id"], order_by="modified desc", limit=1,
+    )
+    if not rows:
+        return None
+    job_id = rows[0].get("job_id")
+    if job_id:
+        # Liveness, not age: an enqueued run is live only while its RQ job is actually
+        # queued or running. A crashed/finished/missing job leaves a 'Running' log
+        # behind, but is_job_enqueued() returns False, so it never locks out a re-run -
+        # and a legitimately long (>2h) job stays live, which the age cap couldn't.
+        if not _is_job_alive(job_id):
+            return None
+    elif frappe.utils.time_diff_in_seconds(
+            frappe.utils.now(), rows[0].modified) >= _ACTIVE_RUN_STALE_SECONDS:
+        return None
+    return rows[0]
+
+
+def _assert_no_active_run(company: str) -> None:
+    """Refuse to start a second migration while one is already running for the same
+    company. Best-effort UX guard - the opening lock in the importer is what actually
+    protects the books. The wizard avoids hitting this by reconnecting to a live run
+    (see ``active_run``); this stays as the server-side backstop."""
+    row = _active_run_log(company)
+    if row:
+        frappe.throw(
+            frappe._(
+                "A migration for '{0}' is already running (started {1}). Please wait "
+                "for it to finish, or open the migration log to check its status."
+            ).format(company, frappe.utils.pretty_date(row.modified))
+        )
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def active_run(erpnext_company: str = "") -> dict:
+    """Return the live migration run for a company, so the wizard can reconnect to a
+    run already in progress (e.g. after a page reload) instead of offering to start a
+    second one. ``{}`` when nothing is running. Read-only."""
+    frappe.only_for(ALLOWED_ROLES)
+    row = _active_run_log(erpnext_company)
+    if not row:
+        return {}
+    return {
+        "log_name": row.name,
+        "status": row.get("status") or "Running",
+        "started": frappe.utils.pretty_date(row.modified),
+    }
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def run_liveness(log_name: str = "") -> dict:
+    """Whether a still-'Running' migration log's run is genuinely alive.
+
+    A hard-killed worker (OOM, redeploy) leaves the log on 'Running' forever, so the
+    log form would otherwise keep claiming "still running" indefinitely. This lets the
+    form ask RQ whether the job is actually queued/running and show a "stopped before
+    completing" state instead. Mirrors ``_active_run_log``'s liveness rule. Read-only.
+
+    Returns ``{status, alive}``: for a 'Running' log, ``alive`` is True while the job
+    is enqueued (or a job-less legacy run that isn't yet stale), False once the worker
+    is gone. For any terminal status, ``alive`` is False and ``status`` carries it.
+    ``{}`` when the log is unknown."""
+    frappe.only_for(ALLOWED_ROLES)
+    if not log_name:
+        return {}
+    row = frappe.db.get_value(
+        "Tally Migration Log", log_name, ["status", "job_id", "modified"], as_dict=True)
+    if not row:
+        return {}
+    if row.status != "Running":
+        return {"status": row.status, "alive": False}
+    alive = True
+    if row.job_id:
+        alive = _is_job_alive(row.job_id)
+    elif frappe.utils.time_diff_in_seconds(
+            frappe.utils.now(), row.modified) >= _ACTIVE_RUN_STALE_SECONDS:
+        alive = False
+    return {"status": row.status, "alive": alive}
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def run_progress(log_name: str = "") -> dict:
+    """Status + latest progress percent/description for a migration run.
+
+    The progress bar is driven over realtime, but realtime is best-effort: a page
+    that reloads mid-run misses the events already sent and would otherwise sit at
+    0%. This lets the wizard poll the persisted progress (written by
+    MasterMigrator._progress) so a reconnected bar advances reliably. ``import_summary``
+    is returned too so the existing poll can render results from a single call once
+    the run finishes. ``{}`` when the log is unknown. Read-only."""
+    frappe.only_for(ALLOWED_ROLES)
+    if not log_name:
+        return {}
+    row = frappe.db.get_value(
+        "Tally Migration Log", log_name, ["status", "import_summary"], as_dict=True
+    )
+    if not row:
+        return {}
+    cached = frappe.cache().get_value(f"tally_migration_progress:{log_name}") or {}
+    return {
+        "status": row.status,
+        "import_summary": row.import_summary,
+        "percent": cached.get("percent"),
+        "description": cached.get("description"),
+    }
+
+
+def _assert_file_access(file_doc) -> None:
+    """Refuse to read a File the current user has no claim to.
+
+    The whitelisted handlers accept an arbitrary ``file_url``; without this a
+    Tally Migration Manager could pass another user's File URL (the wizard's own
+    uploads are private, but a manager could also point at any *public* File on the
+    site) and have the server read its bytes - an IDOR. The migrator only ever needs
+    the file the current user uploaded, which they own, so access is limited to the
+    owner (plus System Manager / Administrator for support and cross-user re-runs).
+    """
+    user = frappe.session.user
+    if user == "Administrator" or file_doc.owner == user:
+        return
+    if "System Manager" in frappe.get_roles(user):
+        return
+    frappe.throw(
+        frappe._("You are not permitted to access this file."),
+        frappe.PermissionError,
+    )
+
+
+def _resolve_file_doc(file_url):
+    """Resolve a file_url to an access-checked File doc, *without* reading or parsing
+    it - so the run endpoint can decide sync-vs-background on cheap metadata (size,
+    remote flag) before paying the parse. Shared with ``_source_from_file``."""
+    # Frappe stores byte-identical uploads at one path, so a single file_url can map
+    # to several File rows owned by different users (e.g. the same export uploaded by
+    # two people). Prefer the row owned by the current user; otherwise fall back to any
+    # match (access is still enforced by _assert_file_access below).
+    name = frappe.db.exists(
+        "File", {"file_url": file_url, "owner": frappe.session.user}
+    ) or frappe.db.exists("File", {"file_url": file_url})
+    # A stale draft (or a re-run from a log) can point at a File that has since been
+    # deleted; surface that as a clear, actionable message instead of a raw 500.
+    if not name:
+        frappe.throw(
+            frappe._(
+                "The uploaded file could not be found - it may have been deleted. "
+                "Please upload your Tally Masters XML again."
+            ),
+            frappe.DoesNotExistError,
+        )
+    file_doc = frappe.get_doc("File", name)
+    _assert_file_access(file_doc)
+    return file_doc
+
+
+def _source_from_file(file_url):
+    """Load the uploaded File and wrap it as a FileTallySource.
+
+    Returns ``(file_doc, source)`` - most callers only need the source, but the
+    migration run also reads ``file_doc.file_name`` for the log label. Access is
+    checked (see ``_assert_file_access``) and the parse is cached per file version.
+    """
+    file_doc = _resolve_file_doc(file_url)
+    cache_key = (frappe.session.user, file_doc.name, str(file_doc.modified))
+    with _SOURCE_CACHE_LOCK:
+        source = _SOURCE_CACHE.get(cache_key)
+        if source is not None and not getattr(source, "released", False):
+            _SOURCE_CACHE.move_to_end(cache_key)     # mark most-recently used
+            return file_doc, source
+        # A released source (its parsed buffers freed after a run to reclaim memory)
+        # can no longer serve get_collection, so fall through and re-parse, overwriting
+        # the stale entry below - otherwise a second use of the same file in this worker
+        # (a re-run, a re-preview, or an import into another company) would extract
+        # nothing from the emptied source and silently import zero records.
+        # A zipped XML is accepted transparently: unzip (with the uncompressed
+        # size held to the same cap) before decoding, so the parser only ever
+        # sees plain XML bytes regardless of how the file was uploaded. The raw
+        # bytes are handed to FileTallySource as-is so it can decode + sanitize +
+        # parse them in a single streaming pass, instead of us materialising the
+        # whole decoded document here first.
+        raw = unzip_if_zip(_raw_file_bytes(file_doc), _max_upload_bytes())
+        source = FileTallySource(raw)
+        _SOURCE_CACHE[cache_key] = source            # inserts as most-recently used
+        while len(_SOURCE_CACHE) > _SOURCE_CACHE_MAX:
+            _SOURCE_CACHE.popitem(last=False)        # evict least-recently used
+    return file_doc, source
+
+
+def _raw_file_bytes(file_doc) -> bytes:
+    """Return the uploaded file's raw bytes.
+
+    ``File.get_content()`` can hand back an already-decoded ``str`` (recent Frappe
+    decodes text uploads as UTF-8 with replacement). That destroys the byte-order
+    mark on a genuine UTF-16 Tally export, so our own encoding detection in
+    ``decode_tally_bytes`` never runs and the parser dies at byte 0. Reading binary
+    keeps the real bytes - and the BOM - intact.
+
+    A "Link" upload (Frappe's FileUploader web-link tab) stores the URL as the
+    File's ``file_url`` and downloads nothing, so ``get_content()`` has no local
+    bytes to read. We support exactly one remote source - a public Google Drive
+    link - and fetch it here, so a too-large export shared via Drive flows through
+    the identical pipeline (a zipped XML on Drive is unpacked downstream as usual).
+    """
+    if getattr(file_doc, "is_remote_file", False):
+        return _download_drive_file(_parse_drive_id(file_doc.file_url))
+    content = file_doc.get_content()
+    raw = bytes(content) if isinstance(content, (bytes, bytearray)) else None
+    if raw is not None:
+        _assert_within_size_limit(len(raw))
+        return raw
+    # A str means get_content() already decoded (and likely corrupted) the bytes;
+    # re-read the original from disk so UTF-16 survives.
+    try:
+        with open(file_doc.get_full_path(), "rb") as fh:
+            raw = fh.read()
+        _assert_within_size_limit(len(raw))
+        return raw
+    except frappe.ValidationError:
+        raise                       # the size-limit rejection must propagate
+    except Exception:
+        frappe.log_error(
+            title="tally_migration: could not read original file bytes",
+            message=frappe.get_traceback(),
+        )
+        # The disk re-read failed, so all we have is the already-decoded str. Re-encoding
+        # it as latin-1 is lossless only if the original was a latin-1 round-trip; for a
+        # genuine UTF-16 Tally export it silently corrupts the data and the migration
+        # then imports wrong masters with no error. Fail loud by default so the user
+        # never gets silently-wrong books. Operators who knowingly handle latin-1 exports
+        # can opt back into the legacy best-effort path via site config.
+        if frappe.conf.get("tally_migration_strict_decode", True):
+            frappe.throw(
+                frappe._(
+                    "Could not read the original bytes of this file, so it can't be "
+                    "imported safely. Please upload your Tally Masters XML again."
+                )
+            )
+        encoded = content.encode("latin-1", errors="ignore")
+        _assert_within_size_limit(len(encoded))
+        return encoded
+
+
+# A Google Drive file id as it appears in the common share-link shapes:
+#   https://drive.google.com/file/d/<ID>/view?usp=sharing
+#   https://drive.google.com/open?id=<ID>
+#   https://drive.google.com/uc?export=download&id=<ID>
+#   https://docs.google.com/spreadsheets/d/<ID>/edit
+# The id alphabet is URL-safe base64 ([A-Za-z0-9_-]); we match the longest run.
+_DRIVE_ID_PATTERNS = (
+    re.compile(r"/file/d/([A-Za-z0-9_-]{10,})"),
+    re.compile(r"/d/([A-Za-z0-9_-]{10,})"),
+    re.compile(r"[?&]id=([A-Za-z0-9_-]{10,})"),
+)
+_BARE_DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{10,}$")
+
+
+def _parse_drive_id(url: str) -> str:
+    """Extract the Drive file id from a share link (or accept a bare id).
+
+    Rejects anything that is not a Google Drive / Docs link so this endpoint can
+    only ever reach Google - it is not a general URL fetcher."""
+    url = (url or "").strip()
+    if not url:
+        frappe.throw(frappe._("Paste a Google Drive link first."))
+    if _BARE_DRIVE_ID.match(url):
+        return url
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        frappe.throw(frappe._("That doesn't look like a link. Paste the full Google Drive share URL."))
+    host = (urlparse(url).hostname or "").lower()
+    if not (host == "google.com" or host.endswith(".google.com")):
+        frappe.throw(frappe._(
+            "Only Google Drive links are supported here. Share your file on "
+            "Google Drive as 'Anyone with the link' and paste that link."
+        ))
+    for pat in _DRIVE_ID_PATTERNS:
+        m = pat.search(url)
+        if m:
+            return m.group(1)
+    frappe.throw(frappe._(
+        "Could not find a file id in that Google Drive link. Open the file in "
+        "Drive, choose Share, copy the link, and paste it here."
+    ))
+
+
+def _download_drive_file(file_id: str) -> bytes:
+    """Stream a public Drive file's bytes, capped at the upload size limit.
+
+    Uses the ``drive.usercontent.google.com`` download endpoint with
+    ``confirm=t`` so Drive's large-file "can't scan for viruses" interstitial is
+    skipped and the real bytes are returned. If Drive serves an HTML page
+    instead (the file isn't shared publicly, or the link is wrong) we detect that
+    and raise an actionable error rather than importing a web page as XML.
+    """
+    import requests
+
+    max_bytes = _max_upload_bytes()
+    try:
+        resp = requests.get(
+            "https://drive.usercontent.google.com/download",
+            params={"id": file_id, "export": "download", "confirm": "t"},
+            stream=True,
+            timeout=(10, 180),
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        frappe.throw(frappe._(
+            "Could not reach Google Drive to download the file ({0}). Check the "
+            "link and your network, then try again."
+        ).format(type(e).__name__))
+
+    chunks, total = [], 0
+    try:
+        for chunk in resp.iter_content(chunk_size=262144):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                frappe.throw(frappe._(
+                    "The Drive file is larger than the {0} MB limit for a single "
+                    "import. Export your Tally masters in smaller batches, or ask "
+                    "your administrator to raise tally_migration_max_upload_mb."
+                ).format(max_bytes // (1024 * 1024)))
+            chunks.append(chunk)
+    finally:
+        resp.close()
+
+    raw = b"".join(chunks)
+    if not raw:
+        frappe.throw(frappe._("Google Drive returned an empty file. Check the link and sharing settings."))
+    # Drive serves the sharing-blocked / not-found case as an HTML page.
+    head = raw[:512].lstrip().lower()
+    if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
+        frappe.throw(frappe._(
+            "Google Drive returned a web page instead of your file. Make sure the "
+            "file is shared as 'Anyone with the link' and the link points to a "
+            "single file (not a folder)."
+        ))
+    return raw
+
+
+def _configured_max_upload_mb() -> int:
+    """The configured single-import size ceiling in MB, coerced to a positive int.
+
+    ``tally_migration_max_upload_mb`` can arrive as a *string* - ``bench set-config``
+    stores a bare value as JSON text unless ``-p`` is passed - so we coerce here.
+    Without this, ``max_mb * 1024 * 1024`` would build a giant string (``str * int``)
+    and the later ``size > ceiling`` comparison raises ``TypeError: '>' not supported
+    between instances of 'int' and 'str'``, turning a raised limit into a 500 on every
+    upload. A missing or non-numeric value falls back to the default rather than
+    failing the upload."""
+    raw = frappe.conf.get("tally_migration_max_upload_mb")
+    if raw in (None, ""):
+        return _DEFAULT_MAX_UPLOAD_MB
+    try:
+        mb = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_UPLOAD_MB
+    return mb if mb > 0 else _DEFAULT_MAX_UPLOAD_MB
+
+
+def _max_upload_bytes() -> int:
+    """The single-import size ceiling in bytes (site-config overridable).
+
+    Applied to a raw upload, to a Drive download, and - as the zip-bomb guard -
+    to the *uncompressed* size of a zipped XML, so every ingestion path is held
+    to the same limit."""
+    return _configured_max_upload_mb() * 1024 * 1024
+
+
+def _assert_within_size_limit(num_bytes: int) -> None:
+    """Reject an oversized upload before parsing, with an actionable message."""
+    max_mb = _configured_max_upload_mb()
+    if num_bytes > _max_upload_bytes():
+        frappe.throw(
+            frappe._(
+                "This file is {0} MB, above the {1} MB limit for a single import. "
+                "Export your Tally masters in smaller batches (for example a few "
+                "ledger groups at a time) and import them one after another - the "
+                "migration is idempotent, so already-imported records are skipped."
+            ).format(round(num_bytes / (1024 * 1024), 1), max_mb)
+        )
+
+
+def _build_masters_config(file_url, file_name, erpnext_company, source,
+                          validation_report, coa_mode, posting_date) -> TallyConfig:
+    """Assemble the TallyConfig for a masters run (shared by sync + background)."""
+    source_company = source.source_company() if hasattr(source, "source_company") else ""
+    return TallyConfig(
+        erpnext_company=erpnext_company,
+        tally_company=source_company or f"File: {file_name or file_url}",
+        source_file=file_url,
+        validation_report=validation_report or "",
+        # Computed server-side from the actual file so the stored audit record of
+        # un-migrated fields is authoritative, not client-supplied.
+        coverage_report=frappe.as_json(coverage_report(source)),
+        mapping_report=frappe.as_json(account_mapping(source, erpnext_company)),
+        coa_mode=coa_mode if coa_mode in ("reuse", "mirror") else "reuse",
+        posting_date=posting_date or "",
+    )
+
+
+def _run_and_summarize(config: TallyConfig, source, uom_overrides: dict | None = None,
+                       record_overrides: dict | None = None,
+                       created_uoms: list | None = None) -> dict:
+    """Run a masters migration and return its summary dict plus the log name."""
+    migrator = MasterMigrator(
+        config, source=source,
+        uom_overrides=uom_overrides or {},
+        record_overrides=record_overrides or {},
+        created_uoms=created_uoms or [],
+    )
+    result = migrator.run().as_dict()
+    result["log_name"] = migrator.log.name if migrator.log else None
+    return result
+
+
+def _enqueue_masters_run(file_url, file_name, erpnext_company, uom_overrides,
+                         validation_report, record_overrides, coa_mode, posting_date,
+                         created_uoms="") -> dict:
+    """Create the log now, hand the run to a background worker, return the log name.
+
+    The log is created (and committed) in the request so the page has something to
+    track immediately; the worker reuses that same log rather than creating a new
+    one. ``enqueue_after_commit`` ensures the job is only published once the log is
+    durably committed, so the worker can never race ahead of it.
+
+    The file is *not* parsed here: the log is created from cheap metadata with empty
+    coverage/mapping reports, and the worker computes and backfills those after its
+    single parse (see ``_run_masters_job``).
+    """
+    config = TallyConfig(
+        erpnext_company=erpnext_company,
+        tally_company=f"File: {file_name or file_url}",
+        source_file=file_url,
+        validation_report=validation_report or "",
+        coverage_report="",          # backfilled by the worker after it parses
+        mapping_report="",
+        coa_mode=coa_mode if coa_mode in ("reuse", "mirror") else "reuse",
+        posting_date=posting_date or "",
+    )
+    migrator = MasterMigrator(config, source=None)
+    log = migrator._create_log()
+    # Stamp the log with the RQ job id so the active-run guard can ask RQ whether the
+    # worker is genuinely still alive (vs crashed), instead of relying only on age.
+    job_id = f"tally-masters-{log.name}"
+    log.db_set("job_id", job_id, commit=True)
+    frappe.enqueue(
+        "tally_migration.api._run_masters_job",
+        queue="long",
+        timeout=4 * 60 * 60,
+        enqueue_after_commit=True,
+        job_id=job_id,
+        file_url=file_url,
+        erpnext_company=erpnext_company,
+        uom_overrides=uom_overrides,
+        validation_report=validation_report,
+        record_overrides=record_overrides,
+        coa_mode=coa_mode,
+        posting_date=posting_date,
+        created_uoms=created_uoms,
+        log_name=log.name,
+    )
+    return {"enqueued": True, "log_name": log.name, "company": erpnext_company}
+
+
+def _run_masters_job(file_url, erpnext_company, uom_overrides, validation_report,
+                     record_overrides, coa_mode, posting_date, log_name, created_uoms=""):
+    """Background entry point: re-parse the file and run the migration into an
+    already-created log. Errors are recorded on the log by ``MasterMigrator`` and
+    re-raised so the failure is also visible in the job/error log."""
+    uom = json.loads(uom_overrides) if uom_overrides else {}
+    records = json.loads(record_overrides) if record_overrides else {}
+    created = json.loads(created_uoms) if created_uoms else []
+    file_doc, source = _source_from_file(file_url)
+    config = _build_masters_config(
+        file_url, file_doc.file_name, erpnext_company, source,
+        validation_report, coa_mode, posting_date)
+    log = frappe.get_doc("Tally Migration Log", log_name)
+    if config.tally_company and log.tally_company != config.tally_company:
+        log.db_set("tally_company", config.tally_company, update_modified=False)
+    # Backfill the source-derived reports the (deferred) web request left empty, so an
+    # enqueued run's log shows the same coverage/mapping a synchronous run would. Only
+    # when still empty, so a re-run from an existing log never clobbers them.
+    if config.coverage_report and not log.coverage_report:
+        log.db_set("coverage_report", config.coverage_report, update_modified=False)
+    if config.mapping_report and not log.mapping_report:
+        log.db_set("mapping_report", config.mapping_report, update_modified=False)
+    MasterMigrator(
+        config, source=source, uom_overrides=uom, record_overrides=records, log=log,
+        created_uoms=created,
+    ).run()
+
+
+def _decode(content) -> str:
+    """Decode File.get_content() bytes/str to text.
+
+    Real Tally exports are UTF-16; ``decode_tally_bytes`` detects the BOM so they
+    don't arrive as mojibake (and fail to parse)."""
+    return decode_tally_bytes(content)

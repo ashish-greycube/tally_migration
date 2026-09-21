@@ -1,0 +1,786 @@
+"""Unit tests for FileTallySource (offline Tally masters XML parsing).
+
+No Tally connection and no Frappe site required - exercises the parser and its
+interop with TallyExtractor directly.
+"""
+import types
+import unittest
+from unittest import mock
+
+from tally_migration.tally.file_source import (
+    FileTallySource, decode_tally_bytes, sanitize_tally_xml,
+)
+from tally_migration.tally.extractors import (
+    TallyExtractor, LEDGER_FIELDS, LEDGER_TAGS, ITEM_FIELDS, ITEM_TAGS,
+    GROUP_FIELDS, GROUP_TAGS,
+)
+
+
+# A trimmed but structurally faithful Tally Prime "Export Masters (XML)" file.
+SAMPLE_XML = """<ENVELOPE>
+  <BODY><IMPORTDATA><REQUESTDATA>
+    <TALLYMESSAGE><GROUP NAME="Sundry Debtors"><PARENT>Primary</PARENT></GROUP></TALLYMESSAGE>
+    <TALLYMESSAGE><GROUP NAME="Retail Debtors"><PARENT>Sundry Debtors</PARENT></GROUP></TALLYMESSAGE>
+    <TALLYMESSAGE><GROUP NAME="Sundry Creditors"><PARENT>Primary</PARENT></GROUP></TALLYMESSAGE>
+    <TALLYMESSAGE>
+      <LEDGER NAME="Customer A"><PARENT>Sundry Debtors</PARENT>
+        <OPENINGBALANCE>1500.00</OPENINGBALANCE></LEDGER>
+    </TALLYMESSAGE>
+    <TALLYMESSAGE><LEDGER NAME="Customer B"><PARENT>Retail Debtors</PARENT></LEDGER></TALLYMESSAGE>
+    <TALLYMESSAGE><LEDGER NAME="Supplier X"><PARENT>Sundry Creditors</PARENT></LEDGER></TALLYMESSAGE>
+    <TALLYMESSAGE>
+      <STOCKITEM NAME="Widget"><PARENT>All Items</PARENT><BASEUNITS>Nos</BASEUNITS></STOCKITEM>
+    </TALLYMESSAGE>
+    <TALLYMESSAGE><GODOWN NAME="Main Store"><PARENT/></GODOWN></TALLYMESSAGE>
+  </REQUESTDATA></IMPORTDATA></BODY>
+</ENVELOPE>"""
+
+
+class TestFileTallySource(unittest.TestCase):
+    def setUp(self):
+        self.source = FileTallySource(SAMPLE_XML)
+
+    def test_ping_always_true(self):
+        self.assertTrue(self.source.ping())
+
+    def test_get_collection_reads_name_attr_and_fields(self):
+        ledgers = self.source.get_collection("Ledger", ["Parent", "OpeningBalance"])
+        by_name = {l["_name"]: l for l in ledgers}
+        self.assertEqual(by_name["Customer A"]["Parent"], "Sundry Debtors")
+        self.assertEqual(by_name["Customer A"]["OpeningBalance"], "1500.00")
+
+    def test_stock_item_tag_with_space_in_objtype(self):
+        items = self.source.get_collection("Stock Item", ["BaseUnits"])
+        self.assertEqual(items[0]["_name"], "Widget")
+        self.assertEqual(items[0]["BaseUnits"], "Nos")
+
+    def test_missing_field_is_empty_string(self):
+        items = self.source.get_collection("Stock Item", ["HSNCode"])
+        self.assertEqual(items[0]["HSNCode"], "")
+
+    def test_interops_with_extractor(self):
+        """The whole point: the extractor can't tell file from live client."""
+        masters = TallyExtractor(self.source).extract_all()
+        self.assertEqual({c["_name"] for c in masters.customers}, {"Customer A", "Customer B"})
+        self.assertEqual({s["_name"] for s in masters.suppliers}, {"Supplier X"})
+        self.assertEqual(len(masters.items), 1)
+        self.assertEqual(len(masters.warehouses), 1)
+
+    def test_invalid_xml_raises(self):
+        with self.assertRaises(Exception):
+            FileTallySource("<ENVELOPE><not-closed>")
+
+    def test_approx_record_count_sums_kept_records(self):
+        # 3 groups + 3 ledgers + 1 stock item + 1 godown in SAMPLE_XML.
+        self.assertEqual(self.source.approx_record_count(), 8)
+
+    def test_scale_many_records_parse_and_count(self):
+        """Smoke test that the streaming parser handles a large record count and
+        the per-tag buckets stay exact (guards the iterparse/root.clear path)."""
+        n = 5000
+        msgs = "".join(
+            f'<TALLYMESSAGE><LEDGER NAME="C{i}"><PARENT>Sundry Debtors</PARENT></LEDGER></TALLYMESSAGE>'
+            for i in range(n)
+        )
+        src = FileTallySource(f"<ENVELOPE><BODY>{msgs}</BODY></ENVELOPE>")
+        self.assertEqual(src.approx_record_count(), n)
+        ledgers = src.get_collection("Ledger", ["Parent"])
+        self.assertEqual(len(ledgers), n)
+        self.assertEqual(ledgers[-1]["_name"], f"C{n - 1}")
+        self.assertEqual(ledgers[0]["Parent"], "Sundry Debtors")
+
+    def test_streaming_ignores_non_master_chrome(self):
+        # A COMPANY header and voucher data must not inflate the record buckets.
+        xml = ("<ENVELOPE><BODY>"
+               "<COMPANY><NAME>Acme</NAME></COMPANY>"
+               "<TALLYMESSAGE><VOUCHER><AMOUNT>1</AMOUNT></VOUCHER></TALLYMESSAGE>"
+               "<TALLYMESSAGE><LEDGER NAME=\"L1\"><PARENT>Sundry Debtors</PARENT></LEDGER></TALLYMESSAGE>"
+               "</BODY></ENVELOPE>")
+        src = FileTallySource(xml)
+        self.assertEqual(src.approx_record_count(), 1)
+        self.assertEqual(src.get_collection("Ledger", ["Parent"])[0]["Parent"], "Sundry Debtors")
+
+    def test_source_company_reads_remote_company_header(self):
+        xml = ("<ENVELOPE><BODY><TALLYMESSAGE><COMPANY><REMOTECMPINFO.LIST>"
+               "<REMOTECMPNAME>Acme Private Limited</REMOTECMPNAME>"
+               "</REMOTECMPINFO.LIST></COMPANY></TALLYMESSAGE></BODY></ENVELOPE>")
+        self.assertEqual(FileTallySource(xml).source_company(), "Acme Private Limited")
+
+
+# Two records: one in real Tally tags (state <LEDSTATENAME>, email <EMAIL>,
+# multi-line <ADDRESS.LIST>, price/cost <STANDARDPRICELIST.LIST> revision lists),
+# and one using the OLD invented flat tags (<LEDGERSTATE>/<LEDGEREMAIL>/flat
+# <ADDRESS>/<STANDARDPRICE>) which the parser must now IGNORE - only real Tally
+# tags are read.
+REAL_TALLY_XML = """<ENVELOPE>
+  <BODY><IMPORTDATA><REQUESTDATA>
+    <TALLYMESSAGE>
+      <LEDGER NAME="Invented Tag Co"><PARENT>Sundry Debtors</PARENT>
+        <LEDGERSTATE>Gujarat</LEDGERSTATE>
+        <LEDGEREMAIL>flat@example.com</LEDGEREMAIL>
+        <ADDRESS>12 Flat Road</ADDRESS></LEDGER>
+    </TALLYMESSAGE>
+    <TALLYMESSAGE>
+      <LEDGER NAME="Real Tally Co"><PARENT>Sundry Debtors</PARENT>
+        <LEDSTATENAME>Karnataka</LEDSTATENAME>
+        <EMAIL>real@example.com</EMAIL>
+        <ADDRESS.LIST TYPE="String">
+          <ADDRESS>Door No 5</ADDRESS>
+          <ADDRESS>MG Road</ADDRESS>
+          <ADDRESS>Bengaluru</ADDRESS>
+        </ADDRESS.LIST></LEDGER>
+    </TALLYMESSAGE>
+    <TALLYMESSAGE>
+      <STOCKITEM NAME="Gadget"><PARENT>All Items</PARENT><BASEUNITS>Nos</BASEUNITS>
+        <STANDARDPRICELIST.LIST><DATE>20240101</DATE><RATE>99.50</RATE></STANDARDPRICELIST.LIST>
+        <STANDARDCOSTLIST.LIST><DATE>20240101</DATE><RATE>72.00</RATE></STANDARDCOSTLIST.LIST></STOCKITEM>
+    </TALLYMESSAGE>
+  </REQUESTDATA></IMPORTDATA></BODY>
+</ENVELOPE>"""
+
+
+class TestReservedNameAttribute(unittest.TestCase):
+    """RESERVEDNAME is an XML *attribute* on <GROUP> (not a child tag), so it is read
+    via the ``{"attr": ...}`` candidate wired through GROUP_TAGS. A renamed reserved
+    group keeps it; a custom group exports it empty."""
+
+    XML = """<ENVELOPE><BODY><IMPORTDATA><REQUESTDATA>
+      <TALLYMESSAGE><GROUP NAME="Duties &amp; Taxes Hello" RESERVEDNAME="Duties &amp; Taxes">
+        <PARENT>Current Liabilities</PARENT></GROUP></TALLYMESSAGE>
+      <TALLYMESSAGE><GROUP NAME="My Custom Group" RESERVEDNAME="">
+        <PARENT>Current Liabilities</PARENT></GROUP></TALLYMESSAGE>
+    </REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>"""
+
+    def setUp(self):
+        self.groups = FileTallySource(self.XML).get_collection(
+            "Group", GROUP_FIELDS, GROUP_TAGS)
+        self.by_name = {g["_name"]: g for g in self.groups}
+
+    def test_reserved_name_attribute_is_read(self):
+        self.assertEqual(self.by_name["Duties & Taxes Hello"]["ReservedName"], "Duties & Taxes")
+
+    def test_custom_group_reserved_name_is_empty(self):
+        self.assertEqual(self.by_name["My Custom Group"]["ReservedName"], "")
+
+    def test_attr_candidate_does_not_read_a_same_named_child(self):
+        # The attr candidate reads the element attribute, not any child tag - so a
+        # field with no such attribute stays empty rather than picking up stray text.
+        groups = FileTallySource(self.XML).get_collection(
+            "Group", ["ReservedName"], {"ReservedName": [{"attr": "NOSUCHATTR"}]})
+        self.assertEqual(groups[0]["ReservedName"], "")
+
+
+class TestRealTallyTags(unittest.TestCase):
+    """Only genuine Tally tags are read; the old invented flat tags are ignored."""
+
+    def setUp(self):
+        from tally_migration.tally.extractors import LEDGER_TAGS, ITEM_TAGS
+        self.source = FileTallySource(REAL_TALLY_XML)
+        self.LEDGER_TAGS = LEDGER_TAGS
+        self.ITEM_TAGS = ITEM_TAGS
+
+    def _ledgers(self):
+        rows = self.source.get_collection(
+            "Ledger", ["Address", "LedgerEmail", "LedgerState"], self.LEDGER_TAGS)
+        return {r["_name"]: r for r in rows}
+
+    def test_invented_flat_tags_are_ignored(self):
+        # <LEDGERSTATE>/<LEDGEREMAIL>/flat <ADDRESS> are no longer read.
+        row = self._ledgers()["Invented Tag Co"]
+        self.assertEqual(row["LedgerState"], "")
+        self.assertEqual(row["LedgerEmail"], "")
+        self.assertEqual(row["Address"], "")
+
+    def test_real_tally_state_and_email(self):
+        row = self._ledgers()["Real Tally Co"]
+        self.assertEqual(row["LedgerState"], "Karnataka")   # <LEDSTATENAME>
+        self.assertEqual(row["LedgerEmail"], "real@example.com")  # <EMAIL>
+
+    def test_multiline_address_list_is_joined(self):
+        row = self._ledgers()["Real Tally Co"]
+        self.assertEqual(row["Address"], "Door No 5, MG Road, Bengaluru")
+
+    def test_standard_price_and_cost_revision_lists(self):
+        item = self.source.get_collection(
+            "Stock Item", ["StandardPrice", "StandardCost"], self.ITEM_TAGS)[0]
+        self.assertEqual(item["StandardPrice"], "99.50")
+        self.assertEqual(item["StandardCost"], "72.00")
+
+
+# A Stock Item whose opening stock is split godown-wise: Tally carries each godown's
+# allocation in a repeating BATCHALLOCATIONS.LIST (GODOWNNAME + the allocation's own
+# OPENINGBALANCE / OPENINGRATE / OPENINGVALUE); the item-level OPENINGBALANCE is their
+# sum. Without reading these the whole opening collapses into one default warehouse.
+GODOWN_OPENING_XML = """<ENVELOPE>
+  <BODY><IMPORTDATA><REQUESTDATA>
+    <TALLYMESSAGE>
+      <STOCKITEM NAME="Pen"><PARENT>Primary</PARENT>
+        <OPENINGBALANCE>30 Nos</OPENINGBALANCE>
+        <BATCHALLOCATIONS.LIST>
+          <GODOWNNAME>Bangalore Godown</GODOWNNAME>
+          <BATCHNAME>Primary Batch</BATCHNAME>
+          <OPENINGBALANCE>20 Nos</OPENINGBALANCE>
+          <OPENINGRATE>10.00/Nos</OPENINGRATE>
+          <OPENINGVALUE>-200.00</OPENINGVALUE>
+        </BATCHALLOCATIONS.LIST>
+        <BATCHALLOCATIONS.LIST>
+          <GODOWNNAME>Delhi Godown</GODOWNNAME>
+          <BATCHNAME>Primary Batch</BATCHNAME>
+          <OPENINGBALANCE>10 Nos</OPENINGBALANCE>
+          <OPENINGRATE>10.00/Nos</OPENINGRATE>
+          <OPENINGVALUE>-100.00</OPENINGVALUE>
+        </BATCHALLOCATIONS.LIST></STOCKITEM>
+    </TALLYMESSAGE>
+    <TALLYMESSAGE>
+      <STOCKITEM NAME="NoBatch"><PARENT>Primary</PARENT>
+        <OPENINGBALANCE>5 Nos</OPENINGBALANCE></STOCKITEM>
+    </TALLYMESSAGE>
+  </REQUESTDATA></IMPORTDATA></BODY>
+</ENVELOPE>"""
+
+
+class TestGodownOpenings(unittest.TestCase):
+    """Item opening stock is read godown-wise from BATCHALLOCATIONS.LIST."""
+
+    def setUp(self):
+        self.source = FileTallySource(GODOWN_OPENING_XML)
+
+    def test_godown_openings_parsed_per_godown(self):
+        out = self.source.item_godown_openings()
+        self.assertIn("Pen", out)
+        rows = out["Pen"]
+        self.assertEqual(len(rows), 2)
+        by_godown = {r["godown"]: r for r in rows}
+        self.assertEqual(by_godown["Bangalore Godown"]["qty"], "20 Nos")
+        self.assertEqual(by_godown["Bangalore Godown"]["value"], "-200.00")
+        self.assertEqual(by_godown["Delhi Godown"]["rate"], "10.00/Nos")
+
+    def test_item_without_batch_allocations_absent(self):
+        out = self.source.item_godown_openings()
+        self.assertNotIn("NoBatch", out)
+
+    def test_extractor_attaches_godown_openings(self):
+        masters = TallyExtractor(self.source).extract_all()
+        pen = next(i for i in masters.items if i["_name"] == "Pen")
+        self.assertEqual(len(pen["GodownOpenings"]), 2)
+        nobatch = next(i for i in masters.items if i["_name"] == "NoBatch")
+        self.assertEqual(nobatch["GodownOpenings"], [])
+
+
+# A batch-tracked, perishable item with MRP - mirrors a real "MRP Batch" export.
+BATCH_MRP_XML = """<ENVELOPE>
+  <BODY><IMPORTDATA><REQUESTDATA>
+    <TALLYMESSAGE>
+      <STOCKITEM NAME="Iphone 10"><PARENT>Primary</PARENT><BASEUNITS>Nos</BASEUNITS>
+        <ISBATCHWISEON>Yes</ISBATCHWISEON>
+        <ISPERISHABLEON>Yes</ISPERISHABLEON>
+        <HASMFGDATE>Yes</HASMFGDATE>
+        <OPENINGBALANCE>90 Nos</OPENINGBALANCE>
+        <MRPDETAILS.LIST>
+          <MRPRATEDETAILS.LIST><MRPRATE>50000.00/Nos</MRPRATE></MRPRATEDETAILS.LIST>
+        </MRPDETAILS.LIST>
+        <BATCHALLOCATIONS.LIST>
+          <MFDON>20260501</MFDON>
+          <GODOWNNAME>Main Location</GODOWNNAME>
+          <BATCHNAME>BATCH1</BATCHNAME>
+          <OPENINGBALANCE>90 Nos</OPENINGBALANCE>
+          <OPENINGRATE>50000.00/Nos</OPENINGRATE>
+          <OPENINGVALUE>-4500000.00</OPENINGVALUE>
+          <EXPIRYPERIOD JD="46142" INC="Y" P="31-Jul-26">31-Jul-26</EXPIRYPERIOD>
+        </BATCHALLOCATIONS.LIST></STOCKITEM>
+    </TALLYMESSAGE>
+  </REQUESTDATA></IMPORTDATA></BODY>
+</ENVELOPE>"""
+
+
+class TestBatchExpiryMrp(unittest.TestCase):
+    """Batch / expiry flags, batch-wise opening detail, and MRP are extracted."""
+
+    def setUp(self):
+        self.source = FileTallySource(BATCH_MRP_XML)
+
+    def test_batch_opening_carries_batch_mfg_expiry(self):
+        row = self.source.item_godown_openings()["Iphone 10"][0]
+        self.assertEqual(row["batch"], "BATCH1")
+        self.assertEqual(row["mfg_date"], "20260501")
+        self.assertEqual(row["expiry"], "31-Jul-26")
+
+    def test_item_flags_and_mrp_read(self):
+        item = self.source.get_collection(
+            "Stock Item", ITEM_FIELDS, ITEM_TAGS)[0]
+        self.assertEqual(item["IsBatchWiseOn"], "Yes")
+        self.assertEqual(item["IsPerishableOn"], "Yes")
+        self.assertEqual(item["Mrp"], "50000.00/Nos")
+
+
+# A real Tally Prime export nests the ledger's bank account under PAYMENTDETAILS.LIST
+# (ACCOUNTNUMBER / IFSCODE / BANKNAME), not the older flat <BANKDETAILS> tag. Before
+# the nested path was mapped, every such party's bank account silently dropped.
+BANK_NESTED_XML = """<ENVELOPE>
+  <BODY><IMPORTDATA><REQUESTDATA>
+    <TALLYMESSAGE>
+      <LEDGER NAME="Cleavland Wears"><PARENT>Sundry Debtors</PARENT>
+        <PAYMENTDETAILS.LIST>
+          <IFSCODE>KOTK006777</IFSCODE>
+          <BANKNAME>Kotak Bank</BANKNAME>
+          <ACCOUNTNUMBER>723801504492</ACCOUNTNUMBER>
+        </PAYMENTDETAILS.LIST></LEDGER>
+    </TALLYMESSAGE>
+    <TALLYMESSAGE>
+      <LEDGER NAME="Flat Shape Co"><PARENT>Sundry Debtors</PARENT>
+        <BANKDETAILS>999888777</BANKDETAILS>
+        <IFSCODE>HDFC0000001</IFSCODE></LEDGER>
+    </TALLYMESSAGE>
+  </REQUESTDATA></IMPORTDATA></BODY>
+</ENVELOPE>"""
+
+
+class TestBankDetails(unittest.TestCase):
+    """Bank account is read from the nested PAYMENTDETAILS.LIST shape AND the older
+    flat tags, so either export populates the ERPNext Bank Account."""
+
+    def setUp(self):
+        from tally_migration.tally.extractors import LEDGER_TAGS
+        self.source = FileTallySource(BANK_NESTED_XML)
+        self.rows = {
+            r["_name"]: r for r in self.source.get_collection(
+                "Ledger", ["BankAccountNo", "BankIFSC", "BankName"], LEDGER_TAGS)}
+
+    def test_nested_payment_details_bank_account_is_read(self):
+        row = self.rows["Cleavland Wears"]
+        self.assertEqual(row["BankAccountNo"], "723801504492")
+        self.assertEqual(row["BankIFSC"], "KOTK006777")
+        self.assertEqual(row["BankName"], "Kotak Bank")
+
+    def test_flat_bank_shape_still_read(self):
+        row = self.rows["Flat Shape Co"]
+        self.assertEqual(row["BankAccountNo"], "999888777")
+        self.assertEqual(row["BankIFSC"], "HDFC0000001")
+
+
+# A faithful slice of a genuine Tally Prime *export*: party mailing + GST details
+# nested in LEDMAILINGDETAILS.LIST / LEDGSTREGDETAILS.LIST, and a Tally ``&#4;``
+# illegal control-char reference (it prefixes "Not Applicable" values). Modelled on
+# real files (Master New.xml / Moooor.xml).
+REAL_EXPORT_XML = """<ENVELOPE>
+  <BODY><IMPORTDATA><REQUESTDATA>
+    <TALLYMESSAGE>
+      <GROUP NAME="Sundry Debtors"><PARENT>Current Assets</PARENT></GROUP>
+    </TALLYMESSAGE>
+    <TALLYMESSAGE>
+      <LEDGER NAME="Garachh">
+        <PARENT>Sundry Debtors</PARENT>
+        <GSTTYPE>&#4; Not Applicable</GSTTYPE>
+        <OPENINGBALANCE>-100000.00</OPENINGBALANCE>
+        <LEDGSTREGDETAILS.LIST>
+          <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
+          <GSTIN>24AAACC1206D1ZM</GSTIN>
+        </LEDGSTREGDETAILS.LIST>
+        <LEDMAILINGDETAILS.LIST>
+          <ADDRESS.LIST TYPE="String">
+            <ADDRESS>Testing</ADDRESS>
+            <ADDRESS>Addresss</ADDRESS>
+          </ADDRESS.LIST>
+          <PINCODE>400086</PINCODE>
+          <MAILINGNAME>Garachh</MAILINGNAME>
+          <STATE>Maharashtra</STATE>
+          <COUNTRY>India</COUNTRY>
+        </LEDMAILINGDETAILS.LIST>
+      </LEDGER>
+    </TALLYMESSAGE>
+  </REQUESTDATA></IMPORTDATA></BODY>
+</ENVELOPE>"""
+
+
+class TestCacheIsolation(unittest.TestCase):
+    """The source caches its parse across requests (api._SOURCE_CACHE), so a consumer
+    that mutates a returned record dict must not poison the cache for later calls."""
+
+    def test_get_collection_returns_isolated_copies(self):
+        from tally_migration.tally.extractors import LEDGER_TAGS
+        src = FileTallySource(REAL_EXPORT_XML)
+        first = src.get_collection("Ledger", ["LedgerState"], LEDGER_TAGS)
+        first[0]["LedgerState"] = "MUTATED"          # simulate apply_record_overrides
+        second = src.get_collection("Ledger", ["LedgerState"], LEDGER_TAGS)
+        self.assertNotEqual(second[0]["LedgerState"], "MUTATED")
+
+    def test_overrides_applied_twice_still_logged(self):
+        """The real bug: a Re-check applies overrides once (mutating the cached
+        parse), then the run applies them again on the SAME cached source. Without
+        isolated copies the second apply sees old == new and the edit vanishes from
+        the audit. With copies, every apply records the change."""
+        from tally_migration.tally.extractors import TallyExtractor
+        from tally_migration.migration.overrides import apply_record_overrides
+        src = FileTallySource(REAL_EXPORT_XML)
+        ext = TallyExtractor(src)
+        overrides = {"Customer": {"Garachh": {"LedgerState": "Gujarat"}}}
+
+        log1 = []
+        apply_record_overrides(ext.extract_all(), overrides, log1)
+        log2 = []
+        apply_record_overrides(ext.extract_all(), overrides, log2)
+
+        self.assertEqual(len(log1), 1)
+        self.assertEqual(len(log2), 1, "cached parse was poisoned - second apply lost the edit")
+        self.assertEqual(log2[0]["old"], "Maharashtra")
+        self.assertEqual(log2[0]["new"], "Gujarat")
+
+
+class TestSourceCacheLRU(unittest.TestCase):
+    """api._SOURCE_CACHE is a bounded LRU. A single slot used to make two managers
+    migrating at once (or one user re-checking two files) evict each other and
+    re-parse a large file on every call; the LRU keeps a handful of parses alive and
+    only drops the least-recently-used past the cap."""
+
+    def setUp(self):
+        from tally_migration import api
+        self.api = api
+        api._SOURCE_CACHE.clear()
+        self.addCleanup(api._SOURCE_CACHE.clear)
+
+    def _fetch(self, fname, parses):
+        """Drive api._source_from_file for a file, recording each real (cache-miss)
+        parse in ``parses``. Returns the source so identity (cache hit) can be checked."""
+        api = self.api
+        file_doc = types.SimpleNamespace(name=fname, modified="m", file_name=fname)
+
+        def make(_decoded):
+            parses.append(fname)
+            return object()                      # a unique sentinel per parse
+
+        with mock.patch.object(api.frappe.db, "exists", return_value=fname), \
+                mock.patch.object(api.frappe, "get_doc", return_value=file_doc), \
+                mock.patch.object(api, "_assert_file_access"), \
+                mock.patch.object(api, "_raw_file_bytes", return_value=b""), \
+                mock.patch.object(api, "_decode", return_value=""), \
+                mock.patch.object(api, "FileTallySource", side_effect=make), \
+                mock.patch.object(api.frappe, "session",
+                                  types.SimpleNamespace(user="u@example.com")):
+            _, source = api._source_from_file("/files/" + fname)
+        return source
+
+    def test_two_files_coexist_and_hit_skips_reparse(self):
+        parses = []
+        s_a = self._fetch("A", parses)
+        self._fetch("B", parses)
+        s_a_again = self._fetch("A", parses)
+        self.assertIs(s_a, s_a_again)            # cache hit returns the same parse
+        self.assertEqual(parses, ["A", "B"])     # A was NOT re-parsed (no thrash)
+
+    def test_evicts_least_recently_used(self):
+        parses = []
+        with mock.patch.object(self.api, "_SOURCE_CACHE_MAX", 2):
+            self._fetch("A", parses)
+            self._fetch("B", parses)
+            self._fetch("C", parses)             # over cap -> evicts A (LRU)
+            self.assertEqual(len(self.api._SOURCE_CACHE), 2)
+            self._fetch("A", parses)             # A was evicted, so re-parsed
+        self.assertEqual(parses, ["A", "B", "C", "A"])
+
+    def test_hit_refreshes_recency(self):
+        parses = []
+        with mock.patch.object(self.api, "_SOURCE_CACHE_MAX", 2):
+            a = self._fetch("A", parses)
+            self._fetch("B", parses)
+            a2 = self._fetch("A", parses)        # hit -> A becomes most-recent
+            self.assertIs(a, a2)
+            self._fetch("C", parses)             # evicts B (now LRU), keeps A
+            a3 = self._fetch("A", parses)        # A still cached
+            self.assertIs(a, a3)
+        self.assertEqual(parses, ["A", "B", "C"])  # A parsed once despite 4 fetches
+
+
+class TestDecode(unittest.TestCase):
+    def test_utf16_bom_is_decoded(self):
+        raw = REAL_EXPORT_XML.encode("utf-16")  # adds a UTF-16 LE BOM
+        self.assertTrue(raw[:2] in (b"\xff\xfe", b"\xfe\xff"))
+        text = decode_tally_bytes(raw)
+        self.assertIn("<LEDGER NAME=\"Garachh\">", text)
+
+    def test_utf8_passthrough(self):
+        raw = REAL_EXPORT_XML.encode("utf-8")
+        self.assertIn("Garachh", decode_tally_bytes(raw))
+
+    def test_str_passthrough(self):
+        self.assertEqual(decode_tally_bytes("already text"), "already text")
+
+    def test_sanitize_strips_illegal_char_ref(self):
+        self.assertNotIn("&#4;", sanitize_tally_xml("x &#4; y"))
+        # a legal reference is preserved
+        self.assertIn("&#65;", sanitize_tally_xml("&#65;"))
+
+
+class TestXmlSafety(unittest.TestCase):
+    """A DTD / entity declaration (the 'billion laughs' DoS vector) is refused -
+    a real Tally masters export never declares one."""
+
+    def test_doctype_is_rejected(self):
+        payload = ('<?xml version="1.0"?>'
+                   '<!DOCTYPE lolz [<!ENTITY lol "lol">]>'
+                   '<ENVELOPE>&lol;</ENVELOPE>')
+        with self.assertRaises(Exception):
+            FileTallySource(payload)
+
+    def test_entity_declaration_is_rejected(self):
+        with self.assertRaises(Exception):
+            FileTallySource('<!ENTITY x "y"><ENVELOPE/>')
+
+    def test_clean_export_still_parses(self):
+        # No DTD - must not be falsely rejected.
+        src = FileTallySource("<ENVELOPE><TALLYMESSAGE/></ENVELOPE>")
+        self.assertTrue(src.ping())
+
+    def test_collection_result_is_cached_per_signature(self):
+        """extract_all + extract_coa both request Group/Ledger; the second call
+        returns the memoised parse - but as a fresh copy, never the same object, so a
+        consumer that mutates the first result can't poison the second (see
+        TestCacheIsolation)."""
+        src = FileTallySource(SAMPLE_XML)
+        first = src.get_collection("Ledger", ["Parent", "OpeningBalance"])
+        second = src.get_collection("Ledger", ["Parent", "OpeningBalance"])
+        self.assertEqual(first, second)        # same data (parse memoised)
+        self.assertIsNot(first, second)        # but isolated copies
+
+
+class TestRealExportFormat(unittest.TestCase):
+    """A genuine export (UTF-16 + &#4; + nested .LIST containers) parses and the
+    party's mailing/GST fields extract from their real nested paths."""
+
+    def _ledger(self):
+        raw = REAL_EXPORT_XML.encode("utf-16")
+        source = FileTallySource(decode_tally_bytes(raw))
+        rows = source.get_collection("Ledger", LEDGER_FIELDS, LEDGER_TAGS)
+        return next(r for r in rows if r["_name"] == "Garachh")
+
+    def test_illegal_ref_does_not_break_parsing(self):
+        # If &#4; weren't stripped, FileTallySource() would raise.
+        self.assertEqual(self._ledger()["_name"], "Garachh")
+
+    def test_nested_gst_details(self):
+        led = self._ledger()
+        self.assertEqual(led["GSTRegistrationNumber"], "24AAACC1206D1ZM")
+        self.assertEqual(led["GSTRegistrationType"], "Regular")
+
+    def test_nested_mailing_details(self):
+        led = self._ledger()
+        self.assertEqual(led["LedgerState"], "Maharashtra")
+        self.assertEqual(led["PinCode"], "400086")
+        self.assertEqual(led["MailingName"], "Garachh")
+        self.assertEqual(led["CountryName"], "India")
+        self.assertEqual(led["Address"], "Testing, Addresss")
+
+    def test_opening_balance_top_level(self):
+        self.assertEqual(self._ledger()["OpeningBalance"], "-100000.00")
+
+
+# A faithful slice of a genuine Stock Item export: the HSN code nests in
+# HSNDETAILS.LIST/HSNCODE while the sibling <HSN> holds the *description*;
+# taxability + supply type nest under GSTDETAILS.LIST. Modelled on a real
+# TallyPrime collection dump (full_MyStockItems2.xml).
+REAL_ITEM_XML = """<ENVELOPE>
+  <BODY><DATA><COLLECTION>
+    <STOCKITEM NAME="Wireless Mouse - Logitech M185">
+      <PARENT>Computer Accessories</PARENT>
+      <BASEUNITS>Nos</BASEUNITS>
+      <ADDITIONALUNITS>&#4; Not Applicable</ADDITIONALUNITS>
+      <HSNDETAILS.LIST>
+        <APPLICABLEFROM>20260401</APPLICABLEFROM>
+        <HSNCODE>847160</HSNCODE>
+        <HSN>Computer input devices</HSN>
+      </HSNDETAILS.LIST>
+      <GSTDETAILS.LIST>
+        <SUPPLYTYPE>Goods</SUPPLYTYPE>
+        <TAXABILITY>Taxable</TAXABILITY>
+        <SRCOFGSTDETAILS>As per Company/Stock Group</SRCOFGSTDETAILS>
+      </GSTDETAILS.LIST>
+    </STOCKITEM>
+  </COLLECTION></DATA></BODY>
+</ENVELOPE>"""
+
+
+class TestRealItemSchema(unittest.TestCase):
+    """The nested HSN/GST tags confirmed against a real Stock Item export."""
+
+    def _item(self):
+        source = FileTallySource(REAL_ITEM_XML)
+        return source.get_collection("Stock Item", ITEM_FIELDS, ITEM_TAGS)[0]
+
+    def test_hsn_code_from_nested_hsncode_not_description(self):
+        # The value must be the code (847160), never the sibling <HSN> description.
+        self.assertEqual(self._item()["HSNCode"], "847160")
+
+    def test_gst_taxability_and_supply_type(self):
+        item = self._item()
+        self.assertEqual(item["GSTTaxability"], "Taxable")
+        self.assertEqual(item["TypeOfSupply"], "Goods")
+
+    def test_base_unit_is_plain_string_reference(self):
+        self.assertEqual(self._item()["BaseUnits"], "Nos")
+
+
+class TestUtf16Decoding(unittest.TestCase):
+    """Real TallyPrime exports are UTF-16-with-BOM. Regression guard for the upload
+    failure where the BOM reached the XML parser and it died at line 1, column 0."""
+
+    def test_utf16_le_bom_decodes_and_parses(self):
+        raw = SAMPLE_XML.encode("utf-16")  # adds the LE BOM
+        self.assertEqual(raw[:2], b"\xff\xfe")
+        src = FileTallySource(decode_tally_bytes(raw))
+        self.assertEqual(src.get_collection("Godown", ["Name"])[0]["_name"], "Main Store")
+
+    def test_utf16_be_bom_decodes(self):
+        raw = b"\xfe\xff" + SAMPLE_XML.encode("utf-16-be")  # prepend BE BOM
+        self.assertIn("<ENVELOPE>", sanitize_tally_xml(decode_tally_bytes(raw)))
+
+    def test_bom_stripped_so_parser_sees_clean_root(self):
+        # A leading BOM character must not survive into the text handed to ElementTree.
+        text = "﻿" + SAMPLE_XML
+        self.assertTrue(sanitize_tally_xml(text).startswith("<ENVELOPE>"))
+
+    def test_str_passthrough_is_unchanged(self):
+        # decode_tally_bytes must not mangle an already-decoded str; the byte-level
+        # recovery now happens in api._raw_file_bytes (reads binary before decoding).
+        self.assertEqual(decode_tally_bytes(SAMPLE_XML), SAMPLE_XML)
+
+
+# A faithful slice of a real export's bill-wise opening detail: one debtor with
+# three outstanding bills that sum to its ledger opening (signs as Tally emits
+# them - negative = Dr), one ledger with an empty allocation list, and one
+# ledger carrying an advance flag. Mirrors what MAX.xml actually contains.
+BILLWISE_XML = """<ENVELOPE><BODY><IMPORTDATA><REQUESTDATA>
+  <TALLYMESSAGE>
+    <LEDGER NAME="ABC Company Limited"><PARENT>Sundry Debtors</PARENT>
+      <OPENINGBALANCE>-30000.00</OPENINGBALANCE>
+      <BILLALLOCATIONS.LIST>
+        <BILLDATE>20200310</BILLDATE><NAME>ABC/1</NAME>
+        <ISADVANCE>No</ISADVANCE><OPENINGBALANCE>-3000.00</OPENINGBALANCE>
+      </BILLALLOCATIONS.LIST>
+      <BILLALLOCATIONS.LIST>
+        <BILLDATE>20200312</BILLDATE><NAME>ABC/2</NAME>
+        <ISADVANCE>No</ISADVANCE><OPENINGBALANCE>-6000.00</OPENINGBALANCE>
+      </BILLALLOCATIONS.LIST>
+      <BILLALLOCATIONS.LIST>
+        <BILLDATE>20200314</BILLDATE><NAME>ABC/3</NAME>
+        <ISADVANCE>No</ISADVANCE><OPENINGBALANCE>-21000.00</OPENINGBALANCE>
+      </BILLALLOCATIONS.LIST>
+    </LEDGER>
+  </TALLYMESSAGE>
+  <TALLYMESSAGE>
+    <LEDGER NAME="No Bills Co"><PARENT>Sundry Debtors</PARENT>
+      <OPENINGBALANCE>-5000.00</OPENINGBALANCE>
+      <BILLALLOCATIONS.LIST>      </BILLALLOCATIONS.LIST>
+    </LEDGER>
+  </TALLYMESSAGE>
+  <TALLYMESSAGE>
+    <LEDGER NAME="Advance Holder"><PARENT>Sundry Debtors</PARENT>
+      <OPENINGBALANCE>2000.00</OPENINGBALANCE>
+      <BILLALLOCATIONS.LIST>
+        <BILLDATE>20200401</BILLDATE><NAME>ADV-1</NAME>
+        <ISADVANCE>Yes</ISADVANCE><OPENINGBALANCE>2000.00</OPENINGBALANCE>
+      </BILLALLOCATIONS.LIST>
+    </LEDGER>
+  </TALLYMESSAGE>
+</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>"""
+
+
+class TestGetChildList(unittest.TestCase):
+    """The repeating-child reader returns one row per BILLALLOCATIONS.LIST."""
+
+    def setUp(self):
+        self.source = FileTallySource(BILLWISE_XML)
+
+    def test_returns_one_row_per_bill_with_parent(self):
+        rows = self.source.get_child_list(
+            "Ledger", "BILLALLOCATIONS.LIST",
+            ["BillDate", "Name", "IsAdvance", "OpeningBalance"])
+        abc = [r for r in rows if r["_parent"] == "ABC Company Limited"]
+        self.assertEqual(len(abc), 3)
+        self.assertEqual(abc[0]["_name"], "ABC/1")          # NAME also under _name
+        self.assertEqual(abc[0]["BillDate"], "20200310")
+        self.assertEqual(abc[0]["OpeningBalance"], "-3000.00")
+
+    def test_empty_list_row_has_blank_fields(self):
+        # An empty <BILLALLOCATIONS.LIST> is still a child element, so the raw
+        # reader returns a blank-field row for it; dropping zero-amount bills is
+        # the extractor's job, not this reader's (kept faithful + unopinionated).
+        rows = self.source.get_child_list(
+            "Ledger", "BILLALLOCATIONS.LIST", ["Name", "OpeningBalance"])
+        empty = [r for r in rows if r["_parent"] == "No Bills Co"]
+        self.assertEqual(len(empty), 1)
+        self.assertEqual(empty[0]["Name"], "")
+        self.assertEqual(empty[0]["OpeningBalance"], "")
+
+    def test_cached_call_is_stable(self):
+        a = self.source.get_child_list("Ledger", "BILLALLOCATIONS.LIST", ["Name"])
+        b = self.source.get_child_list("Ledger", "BILLALLOCATIONS.LIST", ["Name"])
+        self.assertEqual(a, b)        # memoised parse, same data
+        self.assertIsNot(a, b)        # but isolated copies (no cross-call mutation)
+
+
+class TestExtractBillAllocations(unittest.TestCase):
+    """End-to-end parse: XML → list[BillAllocation] with correct signs/dates."""
+
+    def setUp(self):
+        self.bills = TallyExtractor(
+            FileTallySource(BILLWISE_XML)).extract_bill_allocations()
+
+    def _by_party(self, party):
+        return [b for b in self.bills if b.party == party]
+
+    def test_outstanding_bills_parsed_with_dr_sign(self):
+        abc = self._by_party("ABC Company Limited")
+        self.assertEqual(len(abc), 3)
+        self.assertTrue(all(b.dr_cr == "Dr" for b in abc))   # negative → Dr
+        self.assertFalse(any(b.is_advance for b in abc))
+        self.assertEqual(round(sum(b.amount for b in abc), 2), 30000.0)
+
+    def test_bill_date_is_iso(self):
+        first = self._by_party("ABC Company Limited")[0]
+        self.assertEqual(first.bill_date, "2020-03-10")
+        self.assertEqual(first.bill_no, "ABC/1")
+
+    def test_advance_flag_and_cr_sign(self):
+        adv = self._by_party("Advance Holder")
+        self.assertEqual(len(adv), 1)
+        self.assertTrue(adv[0].is_advance)
+        self.assertEqual(adv[0].dr_cr, "Cr")                 # positive → Cr
+
+    def test_party_without_bills_absent(self):
+        self.assertEqual(self._by_party("No Bills Co"), [])
+
+    def test_source_without_child_support_degrades(self):
+        class _Flat:
+            def get_collection(self, *a, **k):
+                return []
+        self.assertEqual(
+            TallyExtractor(_Flat()).extract_bill_allocations(), [])
+
+
+class TestGetCollectionCacheKey(unittest.TestCase):
+    """The parse cache must key on the tag map, not just (obj_type, fields): the same
+    read with a different tag map resolves different tags, so it must not return a
+    prior call's mapping."""
+
+    _XML = (
+        "<ENVELOPE><BODY><IMPORTDATA><REQUESTDATA>"
+        "<TALLYMESSAGE><LEDGER NAME='Acme'><BAR>from-bar</BAR><BAZ>from-baz</BAZ>"
+        "</LEDGER></TALLYMESSAGE>"
+        "</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>"
+    )
+
+    def test_different_tag_map_is_not_served_stale(self):
+        src = FileTallySource(self._XML)
+        first = src.get_collection("Ledger", ["Foo"], {"Foo": ["BAR"]})
+        second = src.get_collection("Ledger", ["Foo"], {"Foo": ["BAZ"]})
+        self.assertEqual(first[0]["Foo"], "from-bar")
+        self.assertEqual(second[0]["Foo"], "from-baz")   # not the cached "from-bar"
+
+    def test_same_tag_map_still_cached(self):
+        src = FileTallySource(self._XML)
+        a = src.get_collection("Ledger", ["Foo"], {"Foo": ["BAR"]})
+        b = src.get_collection("Ledger", ["Foo"], {"Foo": ["BAR"]})
+        self.assertEqual(a, b)
+
+
+if __name__ == "__main__":
+    unittest.main()
