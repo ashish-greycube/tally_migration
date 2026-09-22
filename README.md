@@ -6,6 +6,9 @@ No 1 Frappe/ERPNext app to migrate data from Tally Prime into ERPNext. Built and
 
 Open **Tally Migrator** from the desk. A guided wizard checks your file, shows a preview and changes nothing until you confirm.
 
+Note : The app is free , time is not , if you wish to get our consultancy on this migration , our support packages starts @ 10k (excluding GST) .
+Contact us on sales@greycube.in
+
 ## What It Does
 
 **Masters import** (from Tally's Master Data XML export):
