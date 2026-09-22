@@ -14,16 +14,16 @@ Open **Tally Migrator** from the desk. A guided wizard checks your file, shows a
 - Cost Centers
 - Customers and Suppliers, with addresses, GSTIN, GST category and payment terms
 - Banks and Bank Accounts
+- **Opening balances**:
+  - ledger balances as a submitted opening Journal Entry
+  - invoice-wise (bill-by-bill) receivables and payables as opening invoices, including foreign-currency parties
+  - opening stock as a Stock Reconciliation
 - Stock Groups, Stock Items, Units of Measure (with conversion factors); HSN codes are carried on the items
 - Godowns as Warehouses
 - Price levels as Price Lists and Item Prices
 - Multi-component lists as BOMs
 - Batch-wise stock details as Batches
-- **Opening balances**:
-  - ledger balances as a submitted opening Journal Entry
-  - invoice-wise (bill-by-bill) receivables and payables as opening invoices, including foreign-currency parties
-  - opening stock as a Stock Reconciliation
-
+  
 **Day Book import** (from Tally's Day Book XML export):
 
 - Accounting vouchers (Journal, Receipt, Payment, Contra, Sales, Purchase, Credit Note, Debit Note) are imported as submitted Journal Entries.
